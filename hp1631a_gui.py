@@ -52,7 +52,7 @@ try:
     from hp1631a_extended import (
         PrologixGPIB, HP1631A,
         save_config, load_config,
-        capture_and_export_csv,
+        capture_and_export,
         render_ascii_waveform,
         batch_capture,
         connection_check,
@@ -150,6 +150,7 @@ class Worker(threading.Thread):
         self.analyzer = None
         self._stop   = threading.Event()
         self._cancel = threading.Event()   # set by GUI to abort wait_for_data
+        self._learn_output_dir = "."       # updated by GUI when capture path changes
 
     def cancel(self):
         """Signal any in-progress wait to abort."""
@@ -213,9 +214,10 @@ class Worker(threading.Thread):
             # status byte bits) when data is ready or an error occurs.
             # Mask 0x30 = bit5 (ERROR) | bit4 (DATA_READY).
             # The command is  MASK <value>  on the HP 1631A.
-            self._log("Setting SRQ mask (MASK 48)…", "info")
-            self.gpib.write("MASK 48")    # 0x30 decimal
+            # MB sets the SRQ mask byte. bit1=Measurement Complete, bit5=Error → 34
+            self.gpib.write("MB 34")
             time.sleep(0.2)
+            self.gpib._drain()
             self.log_q.put(("connected", True))
         except Exception as e:
             self._log(f"Connection failed: {e}", "error")
@@ -291,25 +293,8 @@ class Worker(threading.Thread):
         self._log("SDC sent (Selected Device Clear — parser reset)", "cmd")
 
     def do_start(self):
-        if not self._ready(): return
-        self._cancel.clear()
-        self._status("Waiting for acquisition…")
-        self._log("START →", "cmd")
-        self.log_q.put(("acquiring", True))
-        self.analyzer.start()
-        self._log("Waiting for DATA_READY…  (click CANCEL to abort)", "info")
-        ok = self._wait_cancellable(timeout=120)
-        self.log_q.put(("acquiring", False))
-        if ok:
-            self._log("Data ready.", "good")
-            self.log_q.put(("data_ready", True))
-        elif self._cancel.is_set():
-            self._log("Acquisition cancelled.", "error")
-        else:
-            self._log("Timeout — DATA_READY not received within 120 s.", "error")
-            self._log("  Tip: if the instrument has already triggered, use", "info")
-            self._log("  GET TIMING or GET WAVEFORM to download existing data.", "info")
-        self._status("Ready")
+        """Legacy entry point — delegates to do_run."""
+        self.do_run("START")
 
     def _wait_cancellable(self, timeout: float = 120.0,
                           poll_interval: float = 0.5) -> bool:
@@ -327,15 +312,79 @@ class Worker(threading.Thread):
             elif sb & HP1631A.SB_ERROR:
                 self._log(f"Instrument error flag set (status 0x{sb:02X}).", "error")
                 return False
-            elif sb & HP1631A.SB_DATA_READY:
+            elif sb & HP1631A.SB_MEASUREMENT_COMPLETE:
                 return True
             time.sleep(poll_interval)
         return False
 
     def do_stop(self):
         if not self._ready(): return
-        self.analyzer.stop()
-        self._log("STOP →", "cmd")
+        self.analyzer.stop()   # sends ST;
+        self._log("ST; → (STOP)", "cmd")
+
+    def do_clear_stuck(self):
+        """
+        Emergency recovery for "WARNING Awaiting HP-IB transfer".
+        The instrument gets stuck when a configuration-download command
+        (SFORMAT, TFORMAT, STRIGGER, TTRIGGER) is sent without the required
+        data block.  IFC aborts the transfer at the bus level; SDC resets the
+        instrument's HP-IB parser.  Always do this before retrying commands.
+        """
+        if not self._ready(): return
+        self._log("── Clearing stuck HP-IB transfer ────────────", "section")
+        self._status("Sending IFC to abort transfer…")
+        self.gpib.ifc()
+        self._log("IFC sent — bus reset, transfer aborted.", "cmd")
+        time.sleep(0.5)
+        self._status("Sending SDC to reset parser…")
+        self.analyzer.clear()
+        self._log("SDC sent — instrument parser reset.", "cmd")
+        time.sleep(0.5)
+        self.gpib._drain()
+        self._log("Buffer drained.  Re-applying SRQ mask…", "info")
+        self.gpib.write("MB 34")
+        time.sleep(0.3)
+        self.gpib._drain()
+        # Verify instrument is alive again
+        resp = self.analyzer.identify()
+        if resp:
+            self._log(f"Instrument responding: {resp}  ← ready for commands.", "good")
+        else:
+            self._log("No response to ID? after clear — may need power cycle.", "error")
+        self._log("── Clear complete ────────────────────────────", "section")
+        self._status("Ready")
+
+    def do_run(self, cmd: str = "RN"):
+        """
+        Send RN (RUN) or RE (RESUME) and wait for Measurement Complete (bit 1).
+        """
+        if not self._ready(): return
+        self._cancel.clear()
+        self._status(f"Sending {cmd}…")
+        label = {"RN":"RUN","RE":"RESUME","ST":"STOP"}.get(cmd, cmd)
+        self._log(f"{cmd}; → ({label})", "cmd")
+        self.log_q.put(("acquiring", True))
+        self.gpib.write(cmd)
+        self._log(f"Waiting for DATA_READY…  (CANCEL to abort)", "info")
+        ok = self._wait_cancellable(timeout=120)
+        self.log_q.put(("acquiring", False))
+        if ok:
+            self._log("Data ready.", "good")
+            self.log_q.put(("data_ready", True))
+        elif self._cancel.is_set():
+            self._log("Cancelled.", "error")
+        else:
+            sb = self.gpib.serial_poll()
+            self._log(
+                f"Timeout — DATA_READY not set after 120 s.  "
+                f"Final status byte: 0x{sb:02X}  "
+                f"DATA_READY={bool(sb & 0x10)}  ERROR={bool(sb & 0x20)}",
+                "error")
+            self._log("  → If the instrument captured data manually, use", "info")
+            self._log("    GET TIMING or GET WAVEFORM to download it directly.", "info")
+            self._log("  → If DATA_READY never sets, the SRQ mask may need", "info")
+            self._log("    adjustment — try POLL to check the status byte.", "info")
+        self._status("Ready")
 
     def do_raw_cmd(self, cmd):
         if not self._ready(): return
@@ -343,11 +392,26 @@ class Worker(threading.Thread):
         resp = self.analyzer.send_raw(cmd)
         if resp:
             self._log(f"← {resp}", "resp")
+            # Detect stuck-transfer state and warn prominently
+            rl = resp.lower()
+            if "awaiting" in rl and "transfer" in rl:
+                self._log(
+                    "⚠  Instrument is waiting for a data block that was never sent.",
+                    "error")
+                self._log(
+                    "   Click  ⚠ CLEAR STUCK TRANSFER  to recover before sending",
+                    "error")
+                self._log(
+                    "   any further commands.", "error")
+            elif "???" in resp:
+                self._log(
+                    f"   Command not recognised by the HP 1631A.", "error")
 
-    def do_menu(self, name):
+    def do_menu(self, mnemonic: str):
+        """Send a 2-char keyboard mnemonic (SM, FM, TM, LM, WM, CL, etc.)."""
         if not self._ready(): return
-        self.analyzer.set_menu(name)
-        self._log(f"MENU {name}", "cmd")
+        self.gpib.write(mnemonic)
+        self._log(f"{mnemonic}; → (keyboard mnemonic)", "cmd")
 
     # ── capture ─────────────────────────────────────────────────────────────
     def do_capture(self, path, use_srq, also_sr, sr_rate):
@@ -355,7 +419,7 @@ class Worker(threading.Thread):
         self._status("Capturing…")
         self._log("── Capture ───────────────────────────────────", "section")
         self._log("START →", "cmd")
-        self.analyzer.start()
+        self.gpib.write("RN")
         self._cancel.clear()
         self.log_q.put(("acquiring", True))
         self._log("Waiting for trigger…  (click CANCEL to abort)", "info")
@@ -368,20 +432,60 @@ class Worker(threading.Thread):
             self._status("Ready")
             return
 
-        self._status("Downloading listings…")
-        self._log("Downloading STATE…",   "info")
-        slist = self.analyzer.get_state_listing()
-        self._log("Downloading TIMING…",  "info")
-        tlist = self.analyzer.get_timing_listing()
-        self._log("Downloading WAVEFORM…","info")
-        wlist = self.analyzer.get_waveform_listing()
+        self._status("Downloading learn strings…")
+        stem = path.rsplit(".", 1)[0] if "." in path else path
+        files_saved = []
 
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# HP 1631A Capture\n# {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write("--- STATE LISTING ---\n" + slist + "\n\n")
-            f.write("--- TIMING LISTING ---\n" + tlist + "\n\n")
-            f.write("--- WAVEFORM LISTING ---\n" + wlist + "\n")
-        self._log(f"Saved: {path}", "good")
+        self._log("TC; → (Configuration, ~5145 bytes)…", "info")
+        tc = self.gpib.query_binary("TC", max_bytes=6000, delay=0.8)
+        if len(tc) >= 4:
+            p = stem + "_config.lrn"
+            with open(p, "wb") as f: f.write(tc)
+            files_saved.append(p)
+            self._log(f"  Config: {len(tc)} B → {p}", "good")
+
+        self._log("TT; → (Timing data)…", "info")
+        tt = self.gpib.query_binary("TT", max_bytes=65536, delay=1.5)
+        if len(tt) >= 4:
+            p = stem + "_timing.lrn"
+            with open(p, "wb") as f: f.write(tt)
+            files_saved.append(p)
+            header = tt[0:2].decode(errors="replace")
+            count  = (tt[2] << 8) | tt[3]
+            self._log(f"  Timing: {len(tt)} B  header={header!r}  → {p}", "good")
+            from hp1631a_extended import LearnStringParser
+            info = LearnStringParser.parse_timing_header(tt)
+            self._log(f"  CH={info.get('timing_channels')}  "
+                      f"States={info.get('valid_states')}  "
+                      f"Runs={info.get('runs')}", "info")
+            samples = LearnStringParser.extract_timing_data(tt)
+            if samples and info.get("timing_channels"):
+                n_ch = info["timing_channels"]
+                chs = [(f"CH{c}", [(s[c] if c < len(s) else 0) for s in samples])
+                       for c in range(n_ch)]
+                self.log_q.put(("learn_channels", chs))
+
+        self._log("TS; → (State data)…", "info")
+        ts = self.gpib.query_binary("TS", max_bytes=65536, delay=1.5)
+        if len(ts) >= 4:
+            p = stem + "_state.lrn"
+            with open(p, "wb") as f: f.write(ts)
+            files_saved.append(p)
+            self._log(f"  State: {len(ts)} B → {p}", "good")
+
+        self._log("Navigating to LM (List) and reading screen (DR)…", "info")
+        self.gpib.write("LM")
+        time.sleep(0.5)
+        rows = self.analyzer.read_full_screen_rows()
+        screen_text = "\n".join(rows)
+        p = stem + "_screen.txt"
+        with open(p, "w", encoding="utf-8") as f: f.write(screen_text)
+        files_saved.append(p)
+        self.log_q.put(("listing_data", screen_text))
+        non_empty = sum(1 for r in rows if r.strip())
+        self._log(f"  Screen: {non_empty} non-empty rows → {p}", "good")
+
+        self._log(f"Capture complete. {len(files_saved)} file(s) saved.", "good")
 
         if also_sr and HAS_SR:
             sr_path = os.path.splitext(path)[0] + ".sr"
@@ -434,50 +538,70 @@ class Worker(threading.Thread):
 
     # ── CSV export ─────────────────────────────────────────────────────────
     def do_csv_export(self, stem, use_srq):
+        """
+        Capture and export binary learn strings, then decode timing data to CSV.
+        The HP 1631A has no text listing commands — data comes via TT/TS binary.
+        """
         if not self._ready(): return
         self._status("CSV capture…")
         self._log("── CSV Export ────────────────────────────────", "section")
         self.analyzer.start()
         ok = (self.analyzer.wait_for_srq(120) if use_srq
-              else self.analyzer.wait_for_data(120))
+              else self.analyzer.wait_for_measurement_complete(120))
         if not ok:
             self._log("Timeout.", "error")
             self._status("Ready")
             return
-        self._log("Downloading listings…", "info")
 
         import csv as _csv
+        from hp1631a_extended import LearnStringParser
 
-        def _dl_and_save(query_fn, label, out_path):
-            raw = query_fn()
-            if not raw.strip():
-                self._log(f"{label}: no data.", "error")
-                return
-            lines = [l for l in raw.splitlines() if l.strip()]
-            if len(lines) < 2:
-                self._log(f"{label}: too few lines.", "error")
-                return
-            headers = lines[0].split()
-            with open(out_path, "w", newline="", encoding="utf-8") as f:
-                w = _csv.writer(f)
-                w.writerow(headers)
-                for dl in lines[1:]:
-                    parts = dl.split()
-                    if len(parts) < len(headers):
-                        parts += [""] * (len(headers) - len(parts))
-                    w.writerow(parts[:len(headers)])
-            self._log(f"{label}: {len(lines)-1} rows → {out_path}", "good")
+        # ── Timing CSV ────────────────────────────────────────────────────
+        self._log("TT; → Timing learn string…", "info")
+        tt = self.gpib.query_binary("TT", max_bytes=65536, delay=1.5)
+        if len(tt) >= 52:
+            info = LearnStringParser.parse_timing_header(tt)
+            n_ch = info.get("timing_channels", 0)
+            self._log(f"  {len(tt)} B  CH={n_ch}  "
+                      f"States={info.get('valid_states')}  "
+                      f"Runs={info.get('runs')}", "good")
+            samples = LearnStringParser.extract_timing_data(tt)
+            if samples:
+                csv_path = stem + "_timing.csv"
+                headers = [f"CH{i}" for i in range(n_ch or 8)]
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    w = _csv.writer(f)
+                    w.writerow(["sample"] + headers)
+                    for idx, row in enumerate(samples):
+                        w.writerow([idx] + row)
+                self._log(f"  {len(samples)} rows → {csv_path}", "good")
+                # Push to waveform viewer
+                chs = [(f"CH{c}", [s[c] for s in samples if c < len(s)])
+                       for c in range(n_ch or 8)]
+                self.log_q.put(("learn_channels", chs))
+        else:
+            self._log(f"TT: only {len(tt)} bytes — may need valid clock/probes", "error")
 
-        _dl_and_save(self.analyzer.get_state_listing,
-                     "State listing",  stem + "_state.csv")
-        _dl_and_save(self.analyzer.get_timing_listing,
-                     "Timing listing", stem + "_timing.csv")
+        # ── State binary save ─────────────────────────────────────────────
+        self._log("TS; → State learn string…", "info")
+        ts = self.gpib.query_binary("TS", max_bytes=65536, delay=1.5)
+        if len(ts) >= 4:
+            lrn_path = stem + "_state.lrn"
+            with open(lrn_path, "wb") as f: f.write(ts)
+            self._log(f"  {len(ts)} B → {lrn_path} (binary)", "good")
+        else:
+            self._log(f"TS: only {len(ts)} bytes", "error")
 
-        wraw = self.analyzer.get_waveform_listing()
-        wpath = stem + "_waveform.txt"
-        with open(wpath, "w", encoding="utf-8") as f:
-            f.write(wraw)
-        self._log(f"Waveform: {len(wraw)} bytes → {wpath}", "good")
+        # ── Screen text ───────────────────────────────────────────────────
+        self._log("LM + DR → screen text…", "info")
+        self.gpib.write("LM")
+        time.sleep(0.5)
+        rows = self.analyzer.read_full_screen_rows()
+        screen_text = "\n".join(rows)
+        txt_path = stem + "_screen.txt"
+        with open(txt_path, "w", encoding="utf-8") as f: f.write(screen_text)
+        self.log_q.put(("listing_data", screen_text))
+        self._log(f"  Screen: {sum(1 for r in rows if r.strip())} rows → {txt_path}", "good")
 
         self._log("── CSV export complete ───────────────────────", "section")
         self._status("Ready")
@@ -523,13 +647,92 @@ class Worker(threading.Thread):
         self._status("Ready")
 
     def do_get_timing(self):
+        """Legacy stub — download timing via TT learn string instead."""
         if not self._ready(): return
-        self._status("Downloading TLIST?…")
-        self._log("TLIST? →", "cmd")
-        traw = self.analyzer.get_timing_listing()
-        self.log_q.put(("listing_data", traw))
-        self._log(f"Timing listing: {len(traw)} bytes received.", "good")
+        self.do_learn_string("TT")
+
+    def do_get_waveform(self):
+        """Legacy stub — read current screen display instead."""
+        if not self._ready(): return
+        self.do_display_read()
+
+    def do_learn_string(self, cmd: str):
+        """Download a binary learn string (TC, TS, TT, or TE)."""
+        if not self._ready(): return
+        labels = {"TC":"Config","TS":"State","TT":"Timing","TE":"Everything"}
+        label = labels.get(cmd, cmd)
+        self._status(f"Downloading {label} learn string…")
+        self._log(f"{cmd}; → ({label} learn string, binary)", "cmd")
+        self.gpib.write(cmd)
+        time.sleep(0.5 if cmd != "TE" else 2.0)
+        data = self.gpib.read_binary(max_bytes=65536)
+        if len(data) < 4:
+            self._log(f"  No data received ({len(data)} bytes).", "error")
+            self._status("Ready")
+            return
+        header = data[0:2].decode(errors="replace")
+        try:
+            byte_count = (data[2] << 8) | data[3]
+        except IndexError:
+            byte_count = 0
+        self._log(f"  {len(data)} bytes  header={header!r}  "
+                  f"count={byte_count}", "good")
+        # Parse timing learn string for useful info
+        if cmd == "TT" and len(data) >= 52:
+            from hp1631a_extended import LearnStringParser
+            info = LearnStringParser.parse_timing_header(data)
+            self._log(f"  Channels={info.get('timing_channels')}  "
+                      f"States={info.get('valid_states')}  "
+                      f"Runs={info.get('runs')}  "
+                      f"Period={info.get('sample_period_str')}", "info")
+            # Extract samples and push to waveform viewer
+            samples = LearnStringParser.extract_timing_data(data)
+            if samples and info.get("timing_channels"):
+                n_ch = info["timing_channels"]
+                channels = []
+                for ch in range(n_ch):
+                    ch_samples = [(s[ch] if ch < len(s) else 0) for s in samples]
+                    channels.append((f"CH{ch}", ch_samples))
+                self.log_q.put(("learn_channels", channels))
+        # Save to file alongside current capture path
+        import os
+        out_dir = os.path.dirname(self._learn_output_dir)
+        if not out_dir:
+            out_dir = "."
+        fname = os.path.join(out_dir, f"learn_{cmd.lower()}.lrn")
+        with open(fname, "wb") as f:
+            f.write(data)
+        self._log(f"  Saved: {fname}", "good")
         self._status("Ready")
+
+    def do_display_read(self):
+        """DR 1 1 1472 — read the full instrument display as ASCII text."""
+        if not self._ready(): return
+        self._status("Reading display (DR 1 1 1472)…")
+        self._log("DR 1 1 1472; → (full screen read)", "cmd")
+        # Use analyzer.read_full_screen_rows() which handles
+        # inverse-video stripping and CR+LF terminator removal
+        try:
+            rows = self.analyzer.read_full_screen_rows()
+            self._log(f"  {len(rows)} display rows received.", "good")
+            non_empty = [r for r in rows if r.strip()]
+            for r in non_empty:
+                self._log(f"  | {r}", "resp")
+            display_text = "\n".join(rows)
+            self.log_q.put(("listing_data", display_text))
+        except Exception as e:
+            self._log(f"  DR error: {e}", "error")
+        self._status("Ready")
+
+    def do_ke(self):
+        """KE — read the key echo buffer (last front-panel key pressed)."""
+        if not self._ready(): return
+        self._log("KE; → (key echo buffer)", "cmd")
+        resp = self.gpib.query("KE", delay=0.3)
+        if resp:
+            self._log(f"  KE response: {resp!r}", "resp")
+        else:
+            self._log("  KE: no response", "error")
 
     # ── helpers ────────────────────────────────────────────────────────────
     def _ready(self):
@@ -752,6 +955,18 @@ class WaveformCanvas(tk.Frame):
         else:
             self._canvas.xview_scroll(3, "units")
 
+    def load_channels(self, channels: list):
+        """
+        Load pre-parsed channel data directly (from learn string decoder).
+        channels: list of (name, [0/1 sample, ...]) tuples.
+        """
+        self._channels = channels
+        n = len(channels)
+        s = len(channels[0][1]) if channels else 0
+        self._info_lbl.configure(
+            text=f"{n} channel{'s' if n!=1 else ''}  |  {s} samples")
+        self._draw()
+
     def clear(self):
         self._channels = []
         self._cursor_x = None
@@ -908,10 +1123,11 @@ class DiagnosticsDialog(tk.Toplevel):
         self._append("Wait 1 second for the instrument to finish resetting…", "info")
         time.sleep(1.0)
         self._append("Reset complete.", "good")
-        # Re-apply SRQ mask after reset
-        self.worker.gpib.write("MASK 48")
+        # Attempt to re-apply SRQ mask; drain silently if not supported
+        self.worker.gpib.write("MB 34")
         time.sleep(0.2)
-        self._append("SRQ mask re-applied (MASK 48 = DATA_READY + ERROR).", "good")
+        self.worker.gpib._drain()
+        self._append("MB 34; sent (Measurement Complete + Error mask).", "good")
 
     # ── Step 3: Serial poll ──────────────────────────────────────────────────
     def step_serial_poll(self):
@@ -997,6 +1213,7 @@ class DiagnosticsDialog(tk.Toplevel):
             self._append(
                 "\nNo ID command produced a response.\n"
                 "Suggestions:\n"
+                "  • Click  ⚠ CLEAR STUCK TRANSFER  in the main window first, then retry.\n"
                 "  • Re-run Step 2 (bus reset) then retry.\n"
                 "  • Increase the Timeout value in the connection bar to 10 s.\n"
                 "  • Verify the HP 1631A HP-IB interface is enabled in SYSTEM → CONFIG.\n"
@@ -1155,18 +1372,29 @@ class App(tk.Tk):
         f = self._tab(nb, "CONTROL")
 
         self._section(f, "ACQUISITION")
-        row = tk.Frame(f, bg=BG2); row.pack(fill="x", padx=6, pady=3)
-        self._btn(row, "▶  START", lambda: self._worker.submit(
-            self._worker.do_start), GREEN, w=11).pack(side="left", padx=(0,3))
-        self._btn_cancel = self._btn(row, "⊗ CANCEL",
-            self._do_cancel, AMBER, w=9)
+        row = tk.Frame(f, bg=BG2); row.pack(fill="x", padx=6, pady=2)
+        start_btn = self._btn(row, "▶  RN",
+            lambda: self._worker.submit(self._worker.do_run, "RN"), GREEN, w=7)
+        start_btn.pack(side="left", padx=(0,3))
+        self._tooltip(start_btn, "RN; = RUN (Table 10-1) — starts acquisition")
+        run_btn = self._btn(row, "▶  RE",
+            lambda: self._worker.submit(self._worker.do_run, "RE"), GREEN, w=7)
+        run_btn.pack(side="left", padx=(0,3))
+        self._tooltip(run_btn, "RE; = RESUME — continue after single trigger")
+        self._btn_cancel = self._btn(row, "⊗ CANCEL", self._do_cancel, AMBER, w=8)
         self._btn_cancel.pack(side="left", padx=(0,3))
         self._btn_cancel.configure(state="disabled")
-        self._btn(row, "■  STOP",  lambda: self._worker.submit(
-            self._worker.do_stop),  RED,   w=9).pack(side="left")
+        self._btn(row, "■  ST", lambda: self._worker.submit(
+            self._worker.do_stop), RED, w=7).pack(side="left")
+        tk.Label(f, text="  RN=RUN  RE=RESUME  ST=STOP  (Chapter 10 Table 10-1)",
+                 font=FSM, fg=TEXT_DIM, bg=BG2).pack(anchor="w", padx=8, pady=(0,4))
 
         self._section(f, "DIAGNOSTICS")
-        row2 = tk.Frame(f, bg=BG2); row2.pack(fill="x", padx=6, pady=3)
+        # Emergency clear — use when instrument shows "Awaiting HP-IB transfer"
+        self._btn(f, "⚠  CLEAR STUCK TRANSFER  (IFC + SDC)",
+                  lambda: self._worker.submit(self._worker.do_clear_stuck),
+                  RED, w=30).pack(fill="x", padx=6, pady=(0,4))
+        row2 = tk.Frame(f, bg=BG2); row2.pack(fill="x", padx=6, pady=2)
         for label, fn, col in [
             ("CHECK", lambda: self._worker.submit(self._worker.do_check), TEXT_DIM),
             ("POLL",  lambda: self._worker.submit(self._worker.do_poll),  TEXT_DIM),
@@ -1175,35 +1403,71 @@ class App(tk.Tk):
         ]:
             self._btn(row2, label, fn, col, w=7).pack(side="left", padx=(0,3))
 
-        self._section(f, "DISPLAY MENUS  (MENU <name>)")
-        # These are the only arguments the HP 1631A accepts for MENU
-        display_menus = [("WAVEFORM", "LISTING"),
-                         ("STATE",    "TIMING"),
-                         ("CHART",    "COMPARE")]
-        for pair in display_menus:
-            row = tk.Frame(f, bg=BG2); row.pack(fill="x", padx=6, pady=2)
-            for m in pair:
-                self._btn(row, m, lambda n=m: self._worker.submit_cmd(
-                    self._worker.do_menu, n), w=12).pack(side="left", padx=(0,3))
-
-        self._section(f, "FORMAT / TRIGGER MENUS")
-        # These menus are reached via dedicated mnemonics, NOT via MENU
-        fmt_trig = [
-            ("SFORMAT",  "State Format"),
-            ("TFORMAT",  "Timing Format"),
-            ("STRIGGER", "State Trigger"),
-            ("TTRIGGER", "Timing Trigger"),
-            ("SMENU",    "State Menu"),
-            ("TMENU",    "Timing Menu"),
+        self._section(f, "MENU NAVIGATION  (Table 10-1 mnemonics)")
+        # Correct 2-char keyboard mnemonics from Chapter 10
+        menu_rows = [
+            [("SM","System Spec"),    ("FM","Format Spec")],
+            [("TM","Trace/Acquire"),  ("LM","List display")],
+            [("WM","Waveform"),       ("CH","Cursor Home")],
         ]
-        for i in range(0, len(fmt_trig), 2):
+        for pair in menu_rows:
             row = tk.Frame(f, bg=BG2); row.pack(fill="x", padx=6, pady=2)
-            for cmd, tip in fmt_trig[i:i+2]:
-                btn = self._btn(row, cmd,
-                    lambda c=cmd: self._worker.submit_cmd(self._worker.do_raw_cmd, c),
-                    w=10)
-                btn.pack(side="left", padx=(0,3))
-                self._tooltip(btn, tip)
+            for mnemonic, tip in pair:
+                b = self._btn(row, mnemonic,
+                    lambda m=mnemonic: self._worker.submit_cmd(
+                        self._worker.do_menu, m), w=6)
+                b.pack(side="left", padx=(0,3))
+                self._tooltip(b, tip)
+
+        self._section(f, "CURSOR / SCROLL  (Table 10-1)")
+        nav_rows = [
+            [("CU","Cursor Up"),   ("CD","Cursor Down"),
+             ("CL","Cursor Left"), ("CR","Cursor Right")],
+            [("RU","Roll Up"),     ("RD","Roll Down"),
+             ("NX","NEXT[]"),      ("PV","PREV[]")],
+        ]
+        for pair in nav_rows:
+            row = tk.Frame(f, bg=BG2); row.pack(fill="x", padx=6, pady=2)
+            for mnemonic, tip in pair:
+                b = self._btn(row, mnemonic,
+                    lambda m=mnemonic: self._worker.submit_cmd(
+                        self._worker.do_menu, m), w=5)
+                b.pack(side="left", padx=(0,3))
+                self._tooltip(b, tip)
+
+        self._section(f, "DATA DOWNLOAD  (Learn Strings)")
+        # TC/TS/TT/TE are the correct binary data commands (Chapter 10).
+        # SLIST?/TLIST?/WLIST? and CONFIG? do not exist on this instrument.
+        dl_row1 = tk.Frame(f, bg=BG2); dl_row1.pack(fill="x", padx=6, pady=2)
+        for mnemonic, tip in [("TC","Config (~5145 B)"), ("TS","State data")]:
+            b = self._btn(dl_row1, mnemonic,
+                lambda m=mnemonic: self._worker.submit(
+                    self._worker.do_learn_string, m), w=10)
+            b.pack(side="left", padx=(0,3))
+            self._tooltip(b, tip)
+        dl_row2 = tk.Frame(f, bg=BG2); dl_row2.pack(fill="x", padx=6, pady=2)
+        for mnemonic, tip in [("TT","Timing data"), ("TE","Everything")]:
+            b = self._btn(dl_row2, mnemonic,
+                lambda m=mnemonic: self._worker.submit(
+                    self._worker.do_learn_string, m), w=10)
+            b.pack(side="left", padx=(0,3))
+            self._tooltip(b, tip)
+
+        self._section(f, "DISPLAY READ  (DR command)")
+        dr_row = tk.Frame(f, bg=BG2); dr_row.pack(fill="x", padx=6, pady=2)
+        self._btn(dr_row, "READ SCREEN",
+                  lambda: self._worker.submit(self._worker.do_display_read),
+                  BLUE, w=12).pack(side="left", padx=(0,3))
+        self._btn(dr_row, "KE ECHO",
+                  lambda: self._worker.submit(self._worker.do_ke),
+                  w=8).pack(side="left", padx=(0,3))
+        self._btn(dr_row, "BP BEEP",
+                  lambda: self._worker.submit_cmd(
+                      self._worker.do_raw_cmd, "BP"), w=8).pack(side="left")
+        tk.Label(f,
+                 text="  DR reads the current display as ASCII text (23×64 chars).",
+                 font=FSM, fg=TEXT_DIM, bg=BG2
+                 ).pack(anchor="w", padx=8, pady=(0,4))
 
         self._section(f, "TROUBLESHOOTING")
         self._btn(f, "⚑  CONNECTION DIAGNOSTICS",
@@ -1524,6 +1788,7 @@ class App(tk.Tk):
             elif tag == "instrument_id":  self._id_lbl.configure(text=val)
             elif tag == "status":         self._status_lbl.configure(text=val)
             elif tag == "acquiring":      self._set_acquiring(val)
+            elif tag == "learn_channels":  self._waveform.load_channels(val)
             elif tag == "progress_start": self._progress.start(10)
             elif tag == "progress_done":  self._progress.stop(); self._progress["value"]=0
             elif tag == "progress_pct":
@@ -1618,6 +1883,8 @@ class App(tk.Tk):
         sr     = self._sr_var.get() and HAS_SR
         try: rate = int(self._sr_rate_var.get())
         except ValueError: rate = 0
+        import os
+        self._worker._learn_output_dir = os.path.dirname(os.path.abspath(path))
         self._worker.submit(self._worker.do_capture, path, srq, sr, rate)
 
     def _do_save_config(self):
