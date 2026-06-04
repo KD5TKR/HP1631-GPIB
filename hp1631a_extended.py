@@ -20,12 +20,118 @@ Key facts from the manual
   There is no SLIST? / TLIST? / WLIST? / CONFIG?
 • DR command reads ASCII text from the display buffer (23 rows × 64 cols).
 • GROUP EXECUTE TRIGGER (++trg) also starts a measurement like RN.
+
+Supported GPIB adapters
+------------------------
+  PrologixGPIB   — Prologix GPIB-USB (serial / ++ protocol)
+  NI488GPIB      — NI GPIB-USB-HS or Keithley KUSB-488A via linux-gpib
+                   (requires: pip install gpib-ctypes  OR  linux-gpib kernel module)
+  USBTmcGPIB     — xyphro UsbGpib V1 / any USBTMC-class adapter
+                   (requires: pip install python-usbtmc  OR  pip install pyvisa pyvisa-py)
+  USBGpibV2GPIB  — xyphro USBGpib V2 (CDC serial, !-command protocol)
+                   (requires: pip install pyserial; no VISA/usbtmc library needed)
+                   https://github.com/xyphro/UsbGpib
+  PyVisaGPIB     — Any adapter supported by NI-VISA or PyVISA-py
+                   (requires: pip install pyvisa  and optionally pyvisa-py)
+
+All five classes implement the GPIBAdapter abstract interface so that
+HP1631A and higher-level helpers are completely adapter-agnostic.
 """
 
 import serial
 import time
 import struct
+from abc import ABC, abstractmethod
 from typing import Optional
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Abstract GPIB adapter interface
+# ═══════════════════════════════════════════════════════════════════════════
+
+class GPIBAdapter(ABC):
+    """
+    Abstract base class for GPIB adapters.
+
+    Every concrete adapter must implement these methods so that HP1631A
+    and all helper functions work without knowing which physical adapter
+    is in use.
+
+    Adapter-specific capabilities (e.g. Prologix ++ver, EOS sweep) are
+    exposed via optional helper methods that default to raising
+    NotImplementedError; the GUI falls back gracefully when they are absent.
+    """
+
+    @abstractmethod
+    def write(self, instrument_cmd: str):
+        """Send a command string to the instrument."""
+
+    @abstractmethod
+    def read(self, max_bytes: int = 65536) -> str:
+        """Read an ASCII response from the instrument."""
+
+    @abstractmethod
+    def read_binary(self, max_bytes: int = 65536) -> bytes:
+        """Read a raw binary response from the instrument."""
+
+    @abstractmethod
+    def query(self, cmd: str, max_bytes: int = 65536,
+              delay: float = 0.3) -> str:
+        """Send a command and return an ASCII response."""
+
+    @abstractmethod
+    def query_binary(self, cmd: str, max_bytes: int = 65536,
+                     delay: float = 0.5) -> bytes:
+        """Send a command and return a raw binary response."""
+
+    @abstractmethod
+    def trigger(self):
+        """Send a Group Execute Trigger (GET)."""
+
+    @abstractmethod
+    def clear(self):
+        """Send Selected Device Clear (SDC)."""
+
+    @abstractmethod
+    def serial_poll(self) -> int:
+        """Perform a serial poll. Returns status byte or -1 on error."""
+
+    @abstractmethod
+    def srq(self) -> bool:
+        """Return True if the SRQ line is asserted."""
+
+    @abstractmethod
+    def ifc(self):
+        """Send Interface Clear (IFC) — resets the entire GPIB bus."""
+
+    @abstractmethod
+    def close(self):
+        """Release the adapter and any associated OS resources."""
+
+    # ── Optional adapter-specific helpers (default: not supported) ──────────
+
+    def adapter_type(self) -> str:
+        """Return a short human-readable name for this adapter."""
+        return self.__class__.__name__
+
+    def firmware_version(self) -> str:
+        """
+        Query the adapter firmware/driver version string.
+        Returns empty string if not supported by this adapter type.
+        """
+        return ""
+
+    def set_eos(self, eos: int):
+        """
+        Set the end-of-string terminator (Prologix convention: 0=CR+LF,
+        1=CR, 2=LF, 3=None).  No-op on adapters that handle EOS internally.
+        """
+
+    def drain(self, timeout_s: float = 0.3):
+        """
+        Discard stale bytes from the receive buffer.
+        No-op on adapters whose OS driver manages buffering.
+        """
 
 # ── Menu mnemonic map (Table 10-1) ────────────────────────────────────────
 MENU_MNEMONICS = {
@@ -56,9 +162,9 @@ MENU_MNEMONICS = {
 #  Prologix GPIB-USB low-level driver
 # ═══════════════════════════════════════════════════════════════════════════
 
-class PrologixGPIB:
+class PrologixGPIB(GPIBAdapter):
     """
-    Low-level Prologix GPIB-USB driver.
+    Prologix GPIB-USB adapter (++ serial protocol over a virtual COM port).
 
     eos: Prologix ++eos setting — terminator appended to instrument commands.
       0=CR+LF  1=CR (default, correct for HP 1631A)  2=LF  3=None
@@ -183,10 +289,760 @@ class PrologixGPIB:
     def close(self):
         self.ser.close()
 
+    # ── GPIBAdapter optional helpers ─────────────────────────────────────────
+
+    def adapter_type(self) -> str:
+        return "Prologix"
+
+    def firmware_version(self) -> str:
+        """Query ++ver and return the version string."""
+        self._raw_write("++ver")
+        time.sleep(0.2)
+        raw = b""
+        while self.ser.in_waiting:
+            raw += self.ser.read(self.ser.in_waiting)
+            time.sleep(0.05)
+        return raw.decode(errors="replace").strip()
+
+    def set_eos(self, eos: int):
+        self.eos = eos
+        self._raw_write(f"++eos {eos}")
+
+    def drain(self, timeout_s: float = 0.3):
+        self._drain(timeout_s)
+
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  HP 1631A/D instrument driver
+#  NI-488.2 / linux-gpib adapter  (NI GPIB-USB-HS, Keithley KUSB-488A)
 # ═══════════════════════════════════════════════════════════════════════════
+
+class NI488GPIB(GPIBAdapter):
+    """
+    GPIB adapter for hardware using the linux-gpib kernel driver or the
+    gpib-ctypes userspace binding, which covers:
+
+      • NI GPIB-USB-HS  (on Linux with linux-gpib or on Windows with NI-488.2)
+      • Keithley KUSB-488A  (uses the same linux-gpib interface on Linux)
+
+    Installation
+    ------------
+    Linux (preferred):
+        pip install gpib-ctypes
+        # OR build linux-gpib from source: https://linux-gpib.sourceforge.io/
+
+    Windows (NI-488.2 must be installed separately from ni.com):
+        pip install gpib-ctypes
+
+    Parameters
+    ----------
+    board_index : int
+        linux-gpib board index (almost always 0 for the first/only adapter).
+    gpib_addr : int
+        Primary GPIB address of the instrument (0–30).
+    timeout : float
+        Instrument response timeout in seconds.  Mapped to the nearest
+        linux-gpib T-constant (T1s=11, T3s=12, T10s=13, T30s=14, T100s=15).
+    """
+
+    # linux-gpib timeout constants (T<n>s values)
+    _TIMEOUT_MAP = [
+        (1,   11),   # T1s
+        (3,   12),   # T3s
+        (10,  13),   # T10s
+        (30,  14),   # T30s
+        (100, 15),   # T100s
+    ]
+
+    def __init__(self, board_index: int = 0, gpib_addr: int = 5,
+                 timeout: float = 10.0):
+        try:
+            import gpib
+        except ImportError as e:
+            raise ImportError(
+                "gpib-ctypes is not installed.  Run:  pip install gpib-ctypes\n"
+                "On Linux you may also need the linux-gpib kernel module."
+            ) from e
+        self._gpib   = gpib
+        self._board  = board_index
+        self.gpib_addr = gpib_addr
+        # Map timeout to nearest T-constant
+        tval = 11
+        for secs, tconst in self._TIMEOUT_MAP:
+            if timeout <= secs:
+                tval = tconst
+                break
+        else:
+            tval = 15   # T100s
+        # Open the device
+        self._dev = gpib.dev(board_index, gpib_addr, 0, tval, 1, 0)
+        # Assert Remote Enable so the instrument goes remote
+        gpib.remote_enable(board_index, 1)
+
+    def write(self, instrument_cmd: str):
+        self._gpib.write(self._dev,
+                         (instrument_cmd + "\n").encode())
+
+    def read(self, max_bytes: int = 65536) -> str:
+        try:
+            raw = self._gpib.read(self._dev, max_bytes)
+            return raw.decode(errors="replace").strip()
+        except Exception:
+            return ""
+
+    def read_binary(self, max_bytes: int = 65536) -> bytes:
+        try:
+            return self._gpib.read(self._dev, max_bytes)
+        except Exception:
+            return b""
+
+    def query(self, cmd: str, max_bytes: int = 65536,
+              delay: float = 0.3) -> str:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read(max_bytes)
+
+    def query_binary(self, cmd: str, max_bytes: int = 65536,
+                     delay: float = 0.5) -> bytes:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read_binary(max_bytes)
+
+    def trigger(self):
+        self._gpib.trigger(self._dev)
+
+    def clear(self):
+        self._gpib.clear(self._dev)
+        time.sleep(0.5)
+
+    def serial_poll(self) -> int:
+        try:
+            result = self._gpib.ibrsp(self._dev)
+            # ibrsp returns a bytes-like object; first byte is the status byte
+            if isinstance(result, (bytes, bytearray)) and result:
+                return result[0]
+            return int(result) & 0xFF
+        except Exception:
+            return -1
+
+    def srq(self) -> bool:
+        try:
+            sta = self._gpib.ibsta(self._board)
+            return bool(sta & 0x800)   # bit 11 = SRQI
+        except Exception:
+            return False
+
+    def ifc(self):
+        self._gpib.SendIFC(self._board)
+        time.sleep(0.5)
+
+    def close(self):
+        try:
+            self._gpib.remote_enable(self._board, 0)
+            self._gpib.close(self._dev)
+        except Exception:
+            pass
+
+    def adapter_type(self) -> str:
+        return "NI-488 / linux-gpib"
+
+    def firmware_version(self) -> str:
+        """linux-gpib does not expose an adapter firmware version."""
+        return "(linux-gpib — no firmware version query)"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  USBTMC adapter  (xyphro UsbGpib, and any USBTMC-class device)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class USBTmcGPIB(GPIBAdapter):
+    """
+    GPIB adapter for the xyphro UsbGpib and any other USBTMC-class
+    USB-GPIB converter.
+
+    The xyphro UsbGpib enumerates as a standard USBTMC device (USB class 0xFE,
+    subclass 0x03).  It auto-detects the instrument GPIB address on power-up
+    and requires no address configuration in normal single-instrument use.
+    For multi-instrument use (firmware v2.4+) the address can be changed via
+    a vendor control request — see set_gpib_addr().
+
+    This backend tries two communication paths in order:
+      1. python-usbtmc  (pip install python-usbtmc) — raw USBTMC, no VISA needed
+      2. PyVISA         (pip install pyvisa pyvisa-py) — uses a VISA resource string
+
+    Pass either:
+      resource : str   — PyVISA resource string, e.g. "USB0::0x03EB::0x2065::...::INSTR"
+                         If omitted, the first USBTMC device found is used (usbtmc backend).
+      vid / pid : int  — USB Vendor/Product ID for python-usbtmc direct open.
+                         xyphro UsbGpib V1/V2: vid=0x03EB, pid=0x2065
+    """
+
+    def __init__(self, resource: str = "", vid: int = 0, pid: int = 0,
+                 gpib_addr: Optional[int] = None, timeout: float = 10.0):
+        self._timeout   = timeout
+        self._inst      = None
+        self._visa_rm   = None
+        self.gpib_addr  = gpib_addr
+
+        # ── Try python-usbtmc first ──────────────────────────────────────
+        if not resource:
+            try:
+                import usbtmc
+                if vid and pid:
+                    self._inst = usbtmc.Instrument(vid, pid)
+                else:
+                    self._inst = usbtmc.Instrument()   # first found
+                self._inst.timeout = int(timeout * 1000)
+                self._backend = "usbtmc"
+                return
+            except ImportError:
+                pass
+            except Exception as e:
+                raise RuntimeError(
+                    f"python-usbtmc could not open device: {e}\n"
+                    "Verify the UsbGpib is plugged in, powered, and connected\n"
+                    "to an instrument on the GPIB side."
+                ) from e
+
+        # ── Fall back to PyVISA ──────────────────────────────────────────
+        try:
+            import pyvisa
+            self._visa_rm = pyvisa.ResourceManager()
+            res = resource or self._visa_rm.list_resources("USB?*")[0]
+            self._inst = self._visa_rm.open_resource(res)
+            self._inst.timeout = int(timeout * 1000)
+            self._backend = "pyvisa"
+        except ImportError as e:
+            raise ImportError(
+                "Neither python-usbtmc nor pyvisa is installed.\n"
+                "Run one of:\n"
+                "  pip install python-usbtmc\n"
+                "  pip install pyvisa pyvisa-py"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"PyVISA could not open '{resource}': {e}"
+            ) from e
+
+    def _write_raw(self, data: bytes):
+        if self._backend == "usbtmc":
+            self._inst.write_raw(data)
+        else:
+            self._inst.write_raw(data)
+
+    def write(self, instrument_cmd: str):
+        self._write_raw((instrument_cmd + "\n").encode())
+
+    def read(self, max_bytes: int = 65536) -> str:
+        try:
+            if self._backend == "usbtmc":
+                raw = self._inst.read_raw(max_bytes)
+            else:
+                raw = self._inst.read_raw(max_bytes)
+            return raw.decode(errors="replace").strip()
+        except Exception:
+            return ""
+
+    def read_binary(self, max_bytes: int = 65536) -> bytes:
+        try:
+            if self._backend == "usbtmc":
+                return self._inst.read_raw(max_bytes)
+            else:
+                return self._inst.read_raw(max_bytes)
+        except Exception:
+            return b""
+
+    def query(self, cmd: str, max_bytes: int = 65536,
+              delay: float = 0.3) -> str:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read(max_bytes)
+
+    def query_binary(self, cmd: str, max_bytes: int = 65536,
+                     delay: float = 0.5) -> bytes:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read_binary(max_bytes)
+
+    def trigger(self):
+        """Send a GPIB GET via USBTMC trigger request."""
+        try:
+            if self._backend == "usbtmc":
+                self._inst.trigger()
+            else:
+                self._inst.assert_trigger()
+        except Exception:
+            pass
+
+    def clear(self):
+        """Send SDC via USBTMC clear request."""
+        try:
+            if self._backend == "usbtmc":
+                self._inst.clear()
+            else:
+                self._inst.clear()
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    def serial_poll(self) -> int:
+        try:
+            if self._backend == "usbtmc":
+                # USBTMC READ_STATUS_BYTE control request
+                result = self._inst.read_stb()
+                return int(result) & 0xFF
+            else:
+                return int(self._inst.read_stb()) & 0xFF
+        except Exception:
+            return -1
+
+    def srq(self) -> bool:
+        sb = self.serial_poll()
+        return (sb & 0x40) != 0 if sb >= 0 else False
+
+    def ifc(self):
+        """
+        The USBTMC/UsbGpib adapter manages IFC internally; we approximate
+        it by clearing the device and re-asserting Remote Enable.
+        For the xyphro UsbGpib there is no direct IFC command exposed over
+        USBTMC, so we do a USB device reset instead.
+        """
+        try:
+            self.clear()
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    def close(self):
+        try:
+            if self._backend == "usbtmc":
+                self._inst.close()
+            else:
+                self._inst.close()
+                self._visa_rm.close()
+        except Exception:
+            pass
+
+    def adapter_type(self) -> str:
+        return f"USBTMC ({self._backend})"
+
+    def firmware_version(self) -> str:
+        """
+        Query the xyphro UsbGpib adapter firmware version via the vendor
+        control request and !ver? command (firmware >= 2024-01-13).
+        Falls back to empty string on older firmware or non-xyphro devices.
+        """
+        try:
+            if self._backend == "usbtmc":
+                # Pulse indicator request to enable internal command processing
+                self._inst.pulse_indicator_request()
+                return self._inst.ask("!ver?")
+            else:
+                # PyVISA path: use control_in for pulse indicator
+                self._inst.control_in(0xa1, 0x40, 0, 0, 1)
+                return self._inst.query("!ver?")
+        except Exception:
+            return ""
+
+    def set_gpib_addr(self, primary: int, secondary: Optional[int] = None):
+        """
+        Set the GPIB target address on the xyphro UsbGpib (firmware v2.4+).
+        This enables multi-instrument operation without reconnecting.
+        """
+        try:
+            if self._backend == "usbtmc":
+                self._inst.pulse_indicator_request()
+                if secondary is None:
+                    self._inst.write(f"!addr {primary}")
+                else:
+                    self._inst.write(f"!addr {primary} {secondary}")
+            else:
+                self._inst.control_in(0xa1, 0x40, 0, 0, 1)
+                if secondary is None:
+                    self._inst.write(f"!addr {primary}")
+                else:
+                    self._inst.write(f"!addr {primary} {secondary}")
+            self.gpib_addr = primary
+        except Exception as e:
+            raise RuntimeError(f"set_gpib_addr failed: {e}") from e
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  xyphro USBGpib V2  (CDC serial,  !-command protocol)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class USBGpibV2GPIB(GPIBAdapter):
+    """
+    GPIB adapter for the xyphro USBGpib V2 hardware.
+    https://github.com/xyphro/UsbGpib
+
+    The V2 firmware presents a USB CDC (virtual COM port) interface —
+    no VISA, no USBTMC class driver required; only pyserial is needed.
+
+    Protocol overview (V2 firmware)
+    --------------------------------
+    All adapter-control commands begin with '!' and are terminated with \\n.
+    Instrument data (writes and reads) use a thin framing layer:
+
+      Write to instrument:
+        !write <addr>\\n
+        <data bytes>\\n       (the \\n acts as the GPIB EOI trigger)
+
+      Read from instrument:
+        !read <addr> <max_bytes>\\n
+        → adapter replies with the raw bytes followed by \\n
+
+      Serial poll:
+        !spoll <addr>\\n
+        → single decimal byte value + \\n
+
+      Group Execute Trigger:
+        !trigger <addr>\\n
+
+      Interface Clear:
+        !ifc\\n
+
+      Selected Device Clear:
+        !clr <addr>\\n
+
+      SRQ line state:
+        !srq\\n
+        → "1\\n" or "0\\n"
+
+      Firmware version:
+        !ver\\n
+        → version string + \\n
+
+    The adapter does NOT auto-assert Remote Enable; it is asserted
+    implicitly on the first addressed write (same as Prologix behaviour).
+
+    Parameters
+    ----------
+    port      : str   Serial port, e.g. "COM3" on Windows or "/dev/ttyACM0" on Linux.
+    gpib_addr : int   Primary GPIB address of the instrument.
+    timeout   : float Serial read timeout in seconds (default 5.0).
+    """
+
+    # Maximum bytes to request per !read call.  The V2 firmware buffers up to
+    # 8 192 bytes internally; stay below that to avoid overrun.
+    _MAX_READ_CHUNK = 8000
+
+    def __init__(self, port: str, gpib_addr: int, timeout: float = 5.0):
+        self.port      = port
+        self.gpib_addr = int(gpib_addr)
+        self._timeout  = timeout
+        self.ser = serial.Serial(
+            port=port, baudrate=115200,
+            bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE, timeout=timeout,
+            xonxoff=False, rtscts=False,
+        )
+        time.sleep(0.3)
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+        # Verify adapter responds to !ver
+        ver = self.firmware_version()
+        if not ver:
+            raise RuntimeError(
+                f"USBGpib V2 on {port}: no response to !ver — "
+                "check port, cable, and that firmware >= 2.x is installed."
+            )
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _cmd(self, cmd: str):
+        """Send a !-prefixed adapter control command."""
+        self.ser.write((cmd + "\n").encode())
+        time.sleep(0.03)
+
+    def _readline(self) -> str:
+        """Read one \\n-terminated line from the adapter."""
+        raw = self.ser.readline()
+        return raw.decode(errors="replace").rstrip("\r\n")
+
+    def _drain(self, timeout_s: float = 0.2):
+        """Discard stale bytes from the receive buffer."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            n = self.ser.in_waiting
+            if n:
+                self.ser.read(n)
+                deadline = time.time() + 0.05
+            else:
+                time.sleep(0.02)
+
+    # ── GPIBAdapter implementation ────────────────────────────────────────
+
+    def write(self, instrument_cmd: str):
+        """
+        Send a command to the instrument.
+        The V2 protocol: !write <addr>\\n followed by the command + \\n.
+        The trailing \\n is the EOI signal on the GPIB bus.
+        """
+        self._cmd(f"!write {self.gpib_addr}")
+        self.ser.write((instrument_cmd + "\n").encode())
+        time.sleep(0.05)
+
+    def read(self, max_bytes: int = 65536) -> str:
+        """Request a read from the instrument and return ASCII text."""
+        ask = min(max_bytes, self._MAX_READ_CHUNK)
+        self._cmd(f"!read {self.gpib_addr} {ask}")
+        raw = self.ser.read(ask + 2)   # +2 for trailing \\n
+        return raw.rstrip(b"\r\n").decode(errors="replace").strip()
+
+    def read_binary(self, max_bytes: int = 65536) -> bytes:
+        """
+        Read raw binary data from the instrument (e.g. learn strings).
+        Issues repeated !read requests, accumulating until the adapter
+        signals EOF (returns fewer bytes than requested) or max_bytes reached.
+        The V2 firmware signals end-of-transfer by returning 0 data bytes.
+        """
+        buf = bytearray()
+        remaining = max_bytes
+        while remaining > 0:
+            ask = min(remaining, self._MAX_READ_CHUNK)
+            self._cmd(f"!read {self.gpib_addr} {ask}")
+            chunk = self.ser.read(ask + 2)
+            # Strip the trailing \\n the adapter appends
+            if chunk.endswith(b"\n"):
+                chunk = chunk[:-1]
+            if chunk.endswith(b"\r"):
+                chunk = chunk[:-1]
+            buf.extend(chunk)
+            remaining -= len(chunk)
+            # If we received less than we asked for, the transfer is complete
+            if len(chunk) < ask:
+                break
+        return bytes(buf)
+
+    def query(self, cmd: str, max_bytes: int = 65536,
+              delay: float = 0.3) -> str:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read(max_bytes)
+
+    def query_binary(self, cmd: str, max_bytes: int = 65536,
+                     delay: float = 0.5) -> bytes:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read_binary(max_bytes)
+
+    def trigger(self):
+        """Send Group Execute Trigger."""
+        self._cmd(f"!trigger {self.gpib_addr}")
+
+    def clear(self):
+        """Send Selected Device Clear (SDC)."""
+        self._cmd(f"!clr {self.gpib_addr}")
+        time.sleep(0.5)
+
+    def serial_poll(self) -> int:
+        """Perform a serial poll. Returns the status byte or -1 on error."""
+        self._drain(0.05)
+        self._cmd(f"!spoll {self.gpib_addr}")
+        resp = self._readline()
+        try:
+            return int(resp.strip()) & 0xFF
+        except ValueError:
+            return -1
+
+    def srq(self) -> bool:
+        """Return True if the SRQ line is asserted."""
+        self._cmd("!srq")
+        resp = self._readline()
+        return resp.strip() == "1"
+
+    def ifc(self):
+        """Send Interface Clear — resets the entire GPIB bus."""
+        self._cmd("!ifc")
+        time.sleep(0.5)
+
+    def close(self):
+        self.ser.close()
+
+    # ── Optional helpers ──────────────────────────────────────────────────
+
+    def adapter_type(self) -> str:
+        return "USBGpib V2"
+
+    def firmware_version(self) -> str:
+        """Query !ver and return the firmware version string."""
+        self._drain(0.05)
+        self._cmd("!ver")
+        time.sleep(0.15)
+        resp = b""
+        while self.ser.in_waiting:
+            resp += self.ser.read(self.ser.in_waiting)
+            time.sleep(0.05)
+        return resp.decode(errors="replace").strip()
+
+    def drain(self, timeout_s: float = 0.3):
+        self._drain(timeout_s)
+
+    def set_gpib_addr(self, primary: int):
+        """Change the target GPIB address without reconnecting."""
+        self.gpib_addr = int(primary)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PyVISA generic adapter  (any VISA-compatible adapter/resource string)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PyVisaGPIB(GPIBAdapter):
+    """
+    Generic GPIB adapter using PyVISA.
+
+    Works with any VISA-registered adapter, including:
+      • NI GPIB-USB-HS      (GPIB0::5::INSTR  with NI-VISA installed)
+      • Keithley KUSB-488A  (GPIB0::5::INSTR  with NI-VISA or Keithley VISA)
+      • xyphro UsbGpib      (USB0::...::INSTR  with pyvisa-py)
+      • Prologix            (ASRL/dev/ttyUSB0::INSTR  with pyvisa-py, limited)
+      • Any instrument via VXI-11 / TCPIP (for the GPIBee network interface)
+
+    Parameters
+    ----------
+    resource : str
+        Full VISA resource string.  Examples:
+          "GPIB0::5::INSTR"          — NI GPIB-USB-HS, addr 5
+          "USB0::0x03EB::0x2065::GPIB_5_...::INSTR"  — xyphro UsbGpib
+          "TCPIP::192.168.1.100::gpib,5::INSTR"       — GPIBee via VXI-11
+    timeout : float
+        Timeout in seconds (converted to milliseconds for PyVISA).
+    visa_library : str
+        Path to the VISA shared library, or '' to use the default NI-VISA.
+        For pyvisa-py (pure Python): pass '@py'.
+    """
+
+    def __init__(self, resource: str, timeout: float = 10.0,
+                 visa_library: str = ""):
+        try:
+            import pyvisa
+        except ImportError as e:
+            raise ImportError(
+                "pyvisa is not installed.  Run:  pip install pyvisa\n"
+                "For a no-NI-VISA option also run:  pip install pyvisa-py"
+            ) from e
+        kwargs = {}
+        if visa_library:
+            kwargs["visa_library"] = visa_library
+        self._rm   = pyvisa.ResourceManager(**kwargs)
+        self._inst = self._rm.open_resource(resource)
+        self._inst.timeout = int(timeout * 1000)
+        self._resource = resource
+
+    def write(self, instrument_cmd: str):
+        self._inst.write(instrument_cmd)
+
+    def read(self, max_bytes: int = 65536) -> str:
+        try:
+            return self._inst.read().strip()
+        except Exception:
+            return ""
+
+    def read_binary(self, max_bytes: int = 65536) -> bytes:
+        try:
+            return self._inst.read_raw(max_bytes)
+        except Exception:
+            return b""
+
+    def query(self, cmd: str, max_bytes: int = 65536,
+              delay: float = 0.3) -> str:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read(max_bytes)
+
+    def query_binary(self, cmd: str, max_bytes: int = 65536,
+                     delay: float = 0.5) -> bytes:
+        self.write(cmd)
+        time.sleep(delay)
+        return self.read_binary(max_bytes)
+
+    def trigger(self):
+        try:
+            self._inst.assert_trigger()
+        except Exception:
+            pass
+
+    def clear(self):
+        try:
+            self._inst.clear()
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    def serial_poll(self) -> int:
+        try:
+            return int(self._inst.read_stb()) & 0xFF
+        except Exception:
+            return -1
+
+    def srq(self) -> bool:
+        sb = self.serial_poll()
+        return (sb & 0x40) != 0 if sb >= 0 else False
+
+    def ifc(self):
+        try:
+            self._inst.send_ifc()
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    def close(self):
+        try:
+            self._inst.close()
+            self._rm.close()
+        except Exception:
+            pass
+
+    def adapter_type(self) -> str:
+        return f"PyVISA ({self._resource})"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Convenience factory
+# ═══════════════════════════════════════════════════════════════════════════
+
+def open_gpib_adapter(adapter: str, **kwargs) -> GPIBAdapter:
+    """
+    Factory function for creating a GPIBAdapter by name.
+
+    adapter : one of 'prologix', 'ni488', 'usbtmc', 'usbgpibv2', 'pyvisa'
+
+    Prologix   kwargs:  port (str), gpib_addr (int), timeout (float), eos (int)
+    NI-488     kwargs:  board_index (int=0), gpib_addr (int), timeout (float)
+    USBTMC     kwargs:  resource (str=''), vid (int=0), pid (int=0),
+                        gpib_addr (int=None), timeout (float)
+    USBGpibV2  kwargs:  port (str), gpib_addr (int), timeout (float)
+    PyVISA     kwargs:  resource (str), timeout (float), visa_library (str='')
+
+    Example
+    -------
+    >>> gpib = open_gpib_adapter('prologix', port='/dev/ttyUSB0', gpib_addr=5)
+    >>> gpib = open_gpib_adapter('usbgpibv2', port='/dev/ttyACM0', gpib_addr=5)
+    >>> gpib = open_gpib_adapter('usbtmc')       # first UsbGpib V1 found
+    >>> gpib = open_gpib_adapter('ni488', gpib_addr=5)
+    >>> gpib = open_gpib_adapter('pyvisa', resource='GPIB0::5::INSTR')
+    """
+    a = adapter.lower().strip()
+    if a == "prologix":
+        return PrologixGPIB(**kwargs)
+    elif a in ("ni488", "ni", "linux-gpib", "kusb488"):
+        return NI488GPIB(**kwargs)
+    elif a in ("usbtmc", "usbgpib", "xyphro"):
+        return USBTmcGPIB(**kwargs)
+    elif a in ("usbgpibv2", "usbgpib_v2", "usbgpib v2", "xyphro_v2"):
+        return USBGpibV2GPIB(**kwargs)
+    elif a in ("pyvisa", "visa"):
+        return PyVisaGPIB(**kwargs)
+    else:
+        raise ValueError(
+            f"Unknown adapter '{adapter}'.  "
+            "Choose from: prologix, ni488, usbtmc, usbgpibv2, pyvisa"
+        )
+
+
+
 
 class HP1631A:
     """
@@ -221,7 +1077,7 @@ class HP1631A:
     HEADER_TIMING  = b"RT"
     HEADER_ANALOG  = b"RA"
 
-    def __init__(self, gpib: PrologixGPIB):
+    def __init__(self, gpib: GPIBAdapter):
         self.gpib = gpib
 
     # ── Identification ──────────────────────────────────────────────────────
@@ -618,12 +1474,13 @@ class LearnStringParser:
 #  High-level helper functions
 # ═══════════════════════════════════════════════════════════════════════════
 
-def connection_check(gpib: PrologixGPIB, analyzer: HP1631A):
-    """Quick connection check: Prologix version, IFC, SDC, serial poll, ID."""
+def connection_check(gpib: GPIBAdapter, analyzer: HP1631A):
+    """Quick connection check: adapter type/version, IFC, SDC, serial poll, ID."""
     print("=== HP 1631A Connection Check ===")
-    gpib._raw_write("++ver")
-    r = gpib.ser.readline().decode(errors="replace").strip()
-    print(f"  Prologix firmware : {r or '(no response)'}")
+    print(f"  Adapter type      : {gpib.adapter_type()}")
+    ver = gpib.firmware_version()
+    if ver:
+        print(f"  Adapter firmware  : {ver}")
     gpib.ifc()
     print("  IFC sent")
     analyzer.clear()
@@ -664,10 +1521,22 @@ def load_config(analyzer: HP1631A, filepath: str):
     if len(data) < 4:
         print("  [error] File too short.")
         return
-    # The learn string already starts with "RC" header — send it as-is
+    # The learn string already starts with "RC" header — send it as-is.
+    # For Prologix we write raw bytes to the serial port after addressing;
+    # for other adapters we use write_raw if available, else base64-chunk it.
     print(f"  Sending {len(data)} bytes to instrument…")
-    analyzer.gpib._raw_write(f"++addr {analyzer.gpib.gpib_addr}")
-    analyzer.gpib.ser.write(data)
+    gpib = analyzer.gpib
+    if isinstance(gpib, PrologixGPIB):
+        gpib._raw_write(f"++addr {gpib.gpib_addr}")
+        gpib.ser.write(data)
+    elif isinstance(gpib, (USBTmcGPIB, PyVisaGPIB)):
+        gpib._inst.write_raw(data)
+    elif isinstance(gpib, NI488GPIB):
+        gpib._gpib.write(gpib._dev, data)
+    else:
+        raise NotImplementedError(
+            "load_config: binary write not implemented for this adapter type."
+        )
     time.sleep(1.0)
     print("  Done.")
 

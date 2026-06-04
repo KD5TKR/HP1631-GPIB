@@ -50,7 +50,9 @@ if _SCRIPT_DIR not in sys.path:
 
 try:
     from hp1631a_extended import (
-        PrologixGPIB, HP1631A,
+        GPIBAdapter, PrologixGPIB, NI488GPIB, USBTmcGPIB, USBGpibV2GPIB, PyVisaGPIB,
+        open_gpib_adapter,
+        HP1631A,
         save_config, load_config,
         capture_and_export,
         render_ascii_waveform,
@@ -109,12 +111,54 @@ SETTINGS_FILE = os.path.join(_SCRIPT_DIR, "hp1631a_gui.json")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Platform-aware serial port enumeration
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _list_serial_ports() -> list:
+    """
+    Return candidate serial ports for GPIB adapters.
+
+    On Windows  : pyserial list_ports is sufficient (COM1, COM3, …).
+    On Linux    : pyserial sometimes misses CDC ACM devices that appear
+                  after the port scan starts, and never lists ports that
+                  lack a USB serial number string.  We therefore union the
+                  pyserial list with a direct glob of the common device
+                  nodes used by GPIB adapters on Linux:
+
+                    /dev/ttyUSB*   — Prologix (CP210x / FTDI)
+                    /dev/ttyACM*   — xyphro USBGpib V2 (CDC ACM)
+                    /dev/ttyS*     — native RS-232 (unlikely but included)
+
+                  Results are sorted: ACM first (V2), then USB (Prologix),
+                  then anything else, all in natural order.
+    On macOS    : pyserial finds /dev/cu.usbserial-* and /dev/cu.usbmodem*
+                  correctly, so no extra glob is needed.
+    """
+    found = {p.device for p in serial.tools.list_ports.comports()}
+
+    if sys.platform.startswith("linux"):
+        import glob
+        for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS[0-9]*"):
+            found.update(glob.glob(pattern))
+
+        def _sort_key(p):
+            if "ACM" in p:  return (0, p)
+            if "USB" in p:  return (1, p)
+            return (2, p)
+
+        return sorted(found, key=_sort_key)
+
+    return sorted(found)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Settings persistence
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_settings() -> dict:
     defaults = {
         "port": "", "addr": "5", "timeout": "5.0",
+        "adapter": "Prologix",
         "cap_path": "capture.txt", "sr_rate": "10000000",
         "csv_stem": "trace", "batch_n": "10",
         "batch_delay": "1.0", "batch_dir": "captures",
@@ -197,27 +241,47 @@ class Worker(threading.Thread):
         self.log_q.put(("status", msg))
 
     # ── connection ─────────────────────────────────────────────────────────
-    def do_connect(self, port, addr, timeout, eos=2):
-        self._status(f"Opening {port}…")
+    def do_connect(self, adapter_name, port, addr, timeout, eos=2,
+                   resource=""):
+        self._status(f"Opening {adapter_name}…")
         eos_names = {0:"CR+LF", 1:"CR", 2:"LF", 3:"None"}
-        self._log(f"Connecting → {port}  GPIB addr {addr}  EOS={eos_names.get(eos, eos)}", "cmd")
+        self._log(
+            f"Connecting  adapter={adapter_name}  "
+            f"{'port='+port+'  ' if port else ''}"
+            f"{'resource='+resource+'  ' if resource else ''}"
+            f"GPIB addr={addr}  "
+            f"{'EOS='+eos_names.get(eos,str(eos)) if adapter_name=='Prologix' else ''}",
+            "cmd")
         try:
             if self.gpib:
                 try: self.gpib.close()
                 except: pass
-            self.gpib = PrologixGPIB(port, addr, timeout=timeout, eos=eos)
+            a = adapter_name.lower()
+            if a == "prologix":
+                self.gpib = PrologixGPIB(port, addr, timeout=timeout, eos=eos)
+            elif a in ("usbgpib v2 (xyphro)", "usbgpib v2", "usbgpibv2"):
+                self.gpib = USBGpibV2GPIB(port, addr, timeout=timeout)
+            elif a in ("ni-488 / linux-gpib", "ni488", "kusb-488a"):
+                self.gpib = NI488GPIB(gpib_addr=addr, timeout=timeout)
+            elif a in ("usbtmc (xyphro usbgpib v1)", "usbtmc (xyphro usbgpib)", "usbtmc"):
+                self.gpib = USBTmcGPIB(resource=resource, gpib_addr=addr,
+                                        timeout=timeout)
+            elif a in ("pyvisa", "visa"):
+                self.gpib = PyVisaGPIB(resource=resource or
+                                        f"GPIB0::{addr}::INSTR",
+                                        timeout=timeout)
+            else:
+                raise ValueError(f"Unknown adapter: {adapter_name}")
             self.analyzer = HP1631A(self.gpib)
-            self._log("Port open.  Querying ID…", "info")
+            self._log("Adapter open.  Querying ID…", "info")
             resp = self.analyzer.identify()
             self._log(f"ID: {resp}", "good")
             # Configure SRQ mask so the instrument asserts SRQ (and sets
             # status byte bits) when data is ready or an error occurs.
-            # Mask 0x30 = bit5 (ERROR) | bit4 (DATA_READY).
-            # The command is  MASK <value>  on the HP 1631A.
             # MB sets the SRQ mask byte. bit1=Measurement Complete, bit5=Error → 34
             self.gpib.write("MB 34")
             time.sleep(0.2)
-            self.gpib._drain()
+            self.gpib.drain()
             self.log_q.put(("connected", True))
         except Exception as e:
             self._log(f"Connection failed: {e}", "error")
@@ -239,10 +303,14 @@ class Worker(threading.Thread):
         if not self._ready(): return
         self._status("Running connection check…")
         self._log("── Connection Check ──────────────────────────", "section")
-        # Prologix version
-        self.gpib._raw_write("++ver")
-        r = self.gpib.ser.readline().decode(errors="replace").strip()
-        self._log(f"Prologix firmware : {r or '(no response)'}", "info")
+        # Adapter type / firmware version (works for all adapters)
+        atype = self.gpib.adapter_type()
+        self._log(f"Adapter type      : {atype}", "info")
+        ver = self.gpib.firmware_version()
+        if ver:
+            self._log(f"Adapter firmware  : {ver}", "info")
+        else:
+            self._log("Adapter firmware  : (not available for this adapter)", "info")
         # IFC
         self.gpib.ifc()
         self._log("IFC sent (bus reset)", "info")
@@ -340,11 +408,11 @@ class Worker(threading.Thread):
         self.analyzer.clear()
         self._log("SDC sent — instrument parser reset.", "cmd")
         time.sleep(0.5)
-        self.gpib._drain()
+        self.gpib.drain()
         self._log("Buffer drained.  Re-applying SRQ mask…", "info")
         self.gpib.write("MB 34")
         time.sleep(0.3)
-        self.gpib._drain()
+        self.gpib.drain()
         # Verify instrument is alive again
         resp = self.analyzer.identify()
         if resp:
@@ -983,20 +1051,20 @@ class DiagnosticsDialog(tk.Toplevel):
     """
     Step-through diagnostics window.  Opened from the CONTROL tab when the
     user is having trouble connecting.  Walks through:
-      1. Prologix firmware version check
+      1. Adapter type / firmware version
       2. IFC + SDC bus reset
       3. Serial poll (is any device at this address?)
-      4. EOS sweep — tries CR+LF / CR / LF / None in sequence
+      4. EOS sweep — Prologix only; skipped for other adapters
       5. ID command variants — ID?, *IDN?, ID
     Each step can be run independently, and results are shown inline.
     """
 
     STEPS = [
-        ("1  Prologix version",   "step_prologix_ver"),
-        ("2  Bus reset (IFC+SDC)","step_bus_reset"),
-        ("3  Serial poll",        "step_serial_poll"),
-        ("4  EOS sweep",          "step_eos_sweep"),
-        ("5  ID command variants","step_id_variants"),
+        ("1  Adapter / firmware",       "step_adapter_info"),
+        ("2  Bus reset (IFC+SDC)",      "step_bus_reset"),
+        ("3  Serial poll",              "step_serial_poll"),
+        ("4  EOS sweep (Prologix only)","step_eos_sweep"),
+        ("5  ID command variants",      "step_id_variants"),
     ]
 
     def __init__(self, parent, worker):
@@ -1029,7 +1097,7 @@ class DiagnosticsDialog(tk.Toplevel):
             b.bind("<Enter>", lambda e, btn=b: btn.configure(bg=AMBER))
             b.bind("<Leave>", lambda e, btn=b: btn.configure(bg=TEXT_DIM))
 
-        tk.Button(btn_frame, text="▶  Run All Steps",
+        tk.Button(btn_frame, text="\u25b6  Run All Steps",
                   command=self._run_all,
                   font=FUB, fg=BG, bg=GREEN,
                   activebackground=GREEN, activeforeground=BG,
@@ -1077,70 +1145,71 @@ class DiagnosticsDialog(tk.Toplevel):
             return False
         return True
 
-    # ── Step 1: Prologix firmware version ───────────────────────────────────
-    def step_prologix_ver(self):
-        self._append("── Step 1: Prologix firmware version ────────", "section")
+    def _is_prologix(self) -> bool:
+        """Return True when the active adapter is a PrologixGPIB instance."""
+        return HAS_EXT and isinstance(self.worker.gpib, PrologixGPIB)
+
+    def _is_v2(self) -> bool:
+        """Return True when the active adapter is a USBGpibV2GPIB instance."""
+        return HAS_EXT and isinstance(self.worker.gpib, USBGpibV2GPIB)
+
+    # \u2500\u2500 Step 1: Adapter / firmware \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def step_adapter_info(self):
+        self._append("\u2500\u2500 Step 1: Adapter / firmware \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", "section")
         if not self._need_connection(): return
         gpib = self.worker.gpib
-        gpib._raw_write("++ver")
-        time.sleep(0.2)
-        raw = b""
-        while gpib.ser.in_waiting:
-            raw += gpib.ser.read(gpib.ser.in_waiting)
-            time.sleep(0.05)
-        ver = raw.decode(errors="replace").strip()
+        self._append(f"Adapter type: {gpib.adapter_type()}", "good")
+        ver = gpib.firmware_version()
         if ver:
-            self._append(f"Prologix firmware: {ver}", "good")
-            # Parse version number — ++read_tmo_ms needs >= 6.107
-            import re
-            m = re.search(r"(\d+\.\d+)", ver)
-            if m:
-                v = float(m.group(1))
-                if v < 6.107:
-                    self._append(
-                        f"  Version {v} is older than 6.107.  "
-                        f"++read_tmo_ms is not supported — this is the likely cause "
-                        f"of \"Unrecognized command\" in the response buffer.",
-                        "error")
-                    self._append(
-                        "  The driver now drains that error automatically.  "
-                        "If problems persist, update Prologix firmware from "
-                        "http://prologix.biz/", "info")
-                else:
-                    self._append(f"  Version {v} supports ++read_tmo_ms — OK.", "good")
+            self._append(f"Firmware / version: {ver}", "good")
+            if self._is_prologix():
+                import re
+                m = re.search(r"(\d+\.\d+)", ver)
+                if m:
+                    v = float(m.group(1))
+                    if v < 6.107:
+                        self._append(
+                            f"  Version {v} is older than 6.107.  "
+                            "++read_tmo_ms is not supported.  "
+                            "The driver drains the resulting error automatically.\n"
+                            "  Update firmware from http://prologix.biz/ if problems persist.",
+                            "error")
+                    else:
+                        self._append(f"  Version {v} supports ++read_tmo_ms \u2014 OK.", "good")
+            elif self._is_v2():
+                self._append("  USBGpib V2: no minimum firmware version requirement.", "good")
         else:
-            self._append("No response to ++ver.  Check COM port and USB connection.", "error")
+            self._append("(No firmware version query available for this adapter.)", "info")
 
-    # ── Step 2: Bus reset ────────────────────────────────────────────────────
+    # \u2500\u2500 Step 2: Bus reset \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def step_bus_reset(self):
-        self._append("── Step 2: Bus reset (IFC + SDC) ────────────", "section")
+        self._append("\u2500\u2500 Step 2: Bus reset (IFC + SDC) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", "section")
         if not self._need_connection(): return
         self.worker.gpib.ifc()
-        self._append("IFC sent (Interface Clear — resets all devices on the bus).", "good")
+        self._append("IFC sent (Interface Clear \u2014 resets all devices on the bus).", "good")
         time.sleep(0.3)
         self.worker.analyzer.clear()
-        self._append("SDC sent (Selected Device Clear — resets instrument parser).", "good")
-        self._append("Wait 1 second for the instrument to finish resetting…", "info")
+        self._append("SDC sent (Selected Device Clear \u2014 resets instrument parser).", "good")
+        self._append("Wait 1 second for the instrument to finish resetting\u2026", "info")
         time.sleep(1.0)
         self._append("Reset complete.", "good")
-        # Attempt to re-apply SRQ mask; drain silently if not supported
         self.worker.gpib.write("MB 34")
         time.sleep(0.2)
-        self.worker.gpib._drain()
+        self.worker.gpib.drain()
         self._append("MB 34; sent (Measurement Complete + Error mask).", "good")
 
-    # ── Step 3: Serial poll ──────────────────────────────────────────────────
+    # \u2500\u2500 Step 3: Serial poll \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def step_serial_poll(self):
-        self._append("── Step 3: Serial poll ───────────────────────", "section")
+        self._append("\u2500\u2500 Step 3: Serial poll \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", "section")
         if not self._need_connection(): return
         sb = self.worker.gpib.serial_poll()
         if sb < 0:
             self._append(
                 "Serial poll returned no response.\n"
-                "  • Check GPIB cable is seated at both ends.\n"
-                "  • Verify the GPIB address matches the instrument front panel:\n"
-                "    SYSTEM → CONFIG → HP-IB ADDRESS (factory default = 5).\n"
-                "  • Try a different GPIB address in the connection bar.", "error")
+                "  \u2022 Check GPIB cable is seated at both ends.\n"
+                "  \u2022 Verify the GPIB address matches the instrument front panel:\n"
+                "    SYSTEM \u2192 CONFIG \u2192 HP-IB ADDRESS (factory default = 5).\n"
+                "  \u2022 Try a different GPIB address in the connection bar.", "error")
         else:
             self._append(f"Serial poll: 0x{sb:02X} ({sb})", "good")
             self._append(
@@ -1150,43 +1219,47 @@ class DiagnosticsDialog(tk.Toplevel):
                 f"POWER_ON = {bool(sb & 0x80)}", "info")
             self._append("A valid status byte confirms GPIB address and cabling are correct.", "good")
 
-    # ── Step 4: EOS sweep ────────────────────────────────────────────────────
+    # \u2500\u2500 Step 4: EOS sweep (Prologix only) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def step_eos_sweep(self):
-        self._append("── Step 4: EOS terminator sweep ─────────────", "section")
+        self._append("\u2500\u2500 Step 4: EOS terminator sweep \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", "section")
         if not self._need_connection(): return
+        if not self._is_prologix():
+            self._append(
+                "EOS sweep is only applicable to the Prologix adapter.\n"
+                "Other adapters (USBGpib V2, NI-488, USBTMC, PyVISA) handle "
+                "termination internally \u2014 skip this step.", "info")
+            return
         gpib = self.worker.gpib
         eos_names = {0:"CR+LF", 1:"CR", 2:"LF", 3:"None"}
         found_eos = None
-        for eos_val in [1, 0, 2, 3]:       # CR first — most likely for 1631A
+        for eos_val in [1, 0, 2, 3]:
             name = eos_names[eos_val]
-            self._append(f"  Trying EOS={eos_val} ({name})…", "cmd")
-            gpib._raw_write(f"++eos {eos_val}")
-            gpib._drain()
+            self._append(f"  Trying EOS={eos_val} ({name})\u2026", "cmd")
+            gpib.set_eos(eos_val)
+            gpib.drain()
             resp = gpib.query("ID?", delay=0.5)
             if resp and "unrecognized" not in resp.lower() and len(resp) > 1:
-                self._append(f"  ✓ EOS={eos_val} ({name}) → response: {resp!r}", "good")
+                self._append(f"  \u2713 EOS={eos_val} ({name}) \u2192 response: {resp!r}", "good")
                 found_eos = eos_val
-                # Leave adapter in working state
-                gpib.eos = eos_val
                 break
             else:
-                self._append(f"  ✗ EOS={eos_val} ({name}) → {resp!r}", "error")
-            gpib._drain()
+                self._append(f"  \u2717 EOS={eos_val} ({name}) \u2192 {resp!r}", "error")
+            gpib.drain()
             time.sleep(0.3)
 
         if found_eos is not None:
             self._append(
                 f"\nWorking EOS found: {found_eos} ({eos_names[found_eos]}).\n"
-                f"Set the EOS dropdown in the connection bar to  "
-                f"\"{found_eos}-{eos_names[found_eos]}\"  before reconnecting.", "good")
+                f"Set the EOS dropdown to  \"{found_eos}-{eos_names[found_eos]}\"  before reconnecting.",
+                "good")
         else:
             self._append(
                 "\nNo EOS setting produced a valid ID? response.\n"
-                "Proceed to Step 5 — the issue may be the command name.", "error")
+                "Proceed to Step 5 \u2014 the issue may be the command name.", "error")
 
-    # ── Step 5: ID command variants ──────────────────────────────────────────
+    # \u2500\u2500 Step 5: ID command variants \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def step_id_variants(self):
-        self._append("── Step 5: ID command variants ───────────────", "section")
+        self._append("\u2500\u2500 Step 5: ID command variants \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", "section")
         if not self._need_connection(): return
         gpib = self.worker.gpib
         candidates = [
@@ -1198,26 +1271,27 @@ class DiagnosticsDialog(tk.Toplevel):
         ]
         found = False
         for cmd, desc in candidates:
-            self._append(f"  Trying {cmd!r}  ({desc})…", "cmd")
-            gpib._drain()
+            self._append(f"  Trying {cmd!r}  ({desc})\u2026", "cmd")
+            gpib.drain()
             resp = gpib.query(cmd, delay=0.5)
             if resp and "unrecognized" not in resp.lower() and len(resp) > 1:
-                self._append(f"  ✓ {cmd!r} → {resp!r}", "good")
+                self._append(f"  \u2713 {cmd!r} \u2192 {resp!r}", "good")
                 found = True
             else:
-                self._append(f"  ✗ {cmd!r} → {resp!r}", "error")
-            gpib._drain()
+                self._append(f"  \u2717 {cmd!r} \u2192 {resp!r}", "error")
+            gpib.drain()
             time.sleep(0.3)
 
         if not found:
             self._append(
                 "\nNo ID command produced a response.\n"
                 "Suggestions:\n"
-                "  • Click  ⚠ CLEAR STUCK TRANSFER  in the main window first, then retry.\n"
-                "  • Re-run Step 2 (bus reset) then retry.\n"
-                "  • Increase the Timeout value in the connection bar to 10 s.\n"
-                "  • Verify the HP 1631A HP-IB interface is enabled in SYSTEM → CONFIG.\n"
-                "  • Check the GPIB cable — try a different cable if available.", "error")
+                "  \u2022 Click  \u26a0 CLEAR STUCK TRANSFER  in the main window first, then retry.\n"
+                "  \u2022 Re-run Step 2 (bus reset) then retry.\n"
+                "  \u2022 Increase the Timeout value in the connection bar to 10 s.\n"
+                "  \u2022 Verify the HP 1631A HP-IB interface is enabled in SYSTEM \u2192 CONFIG.\n"
+                "  \u2022 Check the GPIB cable \u2014 try a different cable if available.", "error")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main application
@@ -1327,36 +1401,90 @@ class App(tk.Tk):
             tk.Label(parent, text=text, font=FSM, fg=TEXT_DIM,
                      bg=BG2).pack(side="left", padx=(0,3))
 
-        lbl(bar, "PORT")
+        # ── Row 1: adapter + port/resource + addr + timeout + connect ────
+        row1 = tk.Frame(bar, bg=BG2)
+        row1.pack(fill="x")
+
+        lbl(row1, "ADAPTER")
+        self._adapter_var = tk.StringVar(value="Prologix")
+        _adapter_names = [
+            "Prologix",
+            "USBGpib V2 (xyphro)",
+            "NI-488 / linux-gpib",
+            "USBTMC (xyphro UsbGpib V1)",
+            "PyVISA",
+        ]
+        adapter_cb = ttk.Combobox(row1, textvariable=self._adapter_var,
+                                  width=20, font=FM, state="readonly",
+                                  values=_adapter_names)
+        adapter_cb.pack(side="left", padx=(0,8))
+        adapter_cb.bind("<<ComboboxSelected>>", lambda _: self._on_adapter_change())
+
+        lbl(row1, "PORT / RESOURCE")
         self._port_var = tk.StringVar()
-        self._port_cb = ttk.Combobox(bar, textvariable=self._port_var,
-                                     width=9, font=FM, state="readonly")
-        self._port_cb.pack(side="left", padx=(0,8))
+        self._port_cb = ttk.Combobox(row1, textvariable=self._port_var,
+                                     width=14, font=FM, state="readonly")
+        self._port_cb.pack(side="left", padx=(0,2))
+        # Free-text resource entry (shown for USBTMC / PyVISA)
+        self._resource_var = tk.StringVar()
+        self._resource_entry = tk.Entry(row1, textvariable=self._resource_var,
+                                        width=22, font=FM, bg=BG3, fg=TEXT,
+                                        insertbackground=GREEN, relief="flat",
+                                        highlightbackground=BORDER,
+                                        highlightthickness=1)
+        # (packed/hidden by _on_adapter_change)
 
-        lbl(bar, "ADDR")
+        lbl(row1, "ADDR")
         self._addr_var = tk.StringVar(value="5")
-        self._entry(bar, self._addr_var, 4).pack(side="left", padx=(0,8))
+        self._entry(row1, self._addr_var, 4).pack(side="left", padx=(0,8))
 
-        lbl(bar, "TIMEOUT")
+        lbl(row1, "TIMEOUT")
         self._timeout_var = tk.StringVar(value="5.0")
-        self._entry(bar, self._timeout_var, 5).pack(side="left")
-        tk.Label(bar, text="s", font=FSM, fg=TEXT_DIM, bg=BG2
+        self._entry(row1, self._timeout_var, 5).pack(side="left")
+        tk.Label(row1, text="s", font=FSM, fg=TEXT_DIM, bg=BG2
                  ).pack(side="left", padx=(1,10))
 
-        self._btn_conn = self._btn(bar, "CONNECT",    self._do_connect,    GREEN)
+        self._btn_conn = self._btn(row1, "CONNECT",    self._do_connect,    GREEN)
         self._btn_conn.pack(side="left", padx=(0,4))
-        self._btn_disc = self._btn(bar, "DISCONNECT", self._do_disconnect, RED)
+        self._btn_disc = self._btn(row1, "DISCONNECT", self._do_disconnect, RED)
         self._btn_disc.pack(side="left", padx=(0,6))
         self._btn_disc.configure(state="disabled")
 
-        lbl(bar, "EOS")
+        lbl(row1, "EOS")
         self._eos_var = tk.StringVar(value="2-LF")
-        eos_cb = ttk.Combobox(bar, textvariable=self._eos_var, width=9,
+        self._eos_cb = ttk.Combobox(row1, textvariable=self._eos_var, width=9,
                               font=FM, state="readonly",
                               values=["0-CR+LF", "1-CR", "2-LF", "3-None"])
-        eos_cb.pack(side="left", padx=(0,8))
+        self._eos_cb.pack(side="left", padx=(0,8))
 
-        self._btn(bar, "⟳", self._refresh_ports, AMBER, w=2).pack(side="left")
+        self._btn(row1, "⟳", self._refresh_ports, AMBER, w=2).pack(side="left")
+
+        # Trigger initial layout
+        self._on_adapter_change()
+
+    def _on_adapter_change(self):
+        """Show/hide PORT combobox vs RESOURCE entry depending on adapter."""
+        a = self._adapter_var.get()
+        prologix_mode = (a == "Prologix")
+        v2_mode       = a.startswith("USBGpib V2")
+        ni_mode       = a.startswith("NI-488")
+        serial_mode   = prologix_mode or v2_mode   # adapters that use a COM/tty port
+
+        # EOS terminator is only meaningful for Prologix
+        self._eos_cb.configure(state="readonly" if prologix_mode else "disabled")
+
+        # Port combobox vs resource entry vs neither
+        if serial_mode:
+            self._resource_entry.pack_forget()
+            self._port_cb.pack(side="left", padx=(0, 2))
+        elif ni_mode:
+            # NI-488: no port or resource needed — board index only (addr field)
+            self._port_cb.pack_forget()
+            self._resource_entry.pack_forget()
+        else:
+            # USBTMC V1 / PyVISA: free-text VISA resource string
+            self._port_cb.pack_forget()
+            self._resource_entry.pack(side="left", padx=(0, 8))
 
     def _build_left(self, parent):
         nb = ttk.Notebook(parent)
@@ -1682,7 +1810,7 @@ class App(tk.Tk):
         self._status_lbl = tk.Label(bar, text="", font=FSM,
                                     fg=TEXT_DIM, bg=BG3, anchor="w")
         self._status_lbl.pack(side="left", padx=8)
-        tk.Label(bar, text="HP 1631A Controller  |  Prologix GPIB-USB",
+        tk.Label(bar, text="HP 1631A Controller  |  Multi-Adapter GPIB",
                  font=FSM, fg=TEXT_DARK, bg=BG3).pack(side="right", padx=8)
 
     # ── helper widget factories ───────────────────────────────────────────
@@ -1744,6 +1872,8 @@ class App(tk.Tk):
 
     def _load_settings_to_ui(self):
         s = self._settings
+        self._adapter_var.set(s.get("adapter", "Prologix"))
+        self._resource_var.set(s.get("resource", ""))
         self._addr_var.set(s.get("addr", "5"))
         self._timeout_var.set(s.get("timeout", "5.0"))
         self._eos_var.set(s.get("eos", "2-LF"))
@@ -1756,10 +1886,13 @@ class App(tk.Tk):
         self._srq_var.set(s.get("use_srq", False))
         if HAS_SR:
             self._sr_var.set(s.get("also_sr", True))
+        self._on_adapter_change()
         # Port will be set after refresh_ports
 
     def _collect_settings(self) -> dict:
         return {
+            "adapter":     self._adapter_var.get(),
+            "resource":    self._resource_var.get(),
             "port":        self._port_var.get(),
             "addr":        self._addr_var.get(),
             "timeout":     self._timeout_var.get(),
@@ -1826,11 +1959,11 @@ class App(tk.Tk):
     # ── connection ────────────────────────────────────────────────────────
 
     def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
+        ports = _list_serial_ports()
         if not ports:
             ports = ["(none)"]
         self._port_cb["values"] = ports
-        saved = self._settings.get("port","")
+        saved = self._settings.get("port", "")
         if saved and saved in ports:
             self._port_var.set(saved)
         elif ports:
@@ -1841,7 +1974,9 @@ class App(tk.Tk):
             messagebox.showerror("Missing file",
                 f"hp1631a_extended.py not found.\nError: {_ext_err}")
             return
-        port = self._port_var.get()
+        adapter = self._adapter_var.get()
+        port    = self._port_var.get()
+        resource = self._resource_var.get().strip()
         try:
             addr    = int(self._addr_var.get())
             timeout = float(self._timeout_var.get())
@@ -1850,7 +1985,8 @@ class App(tk.Tk):
             messagebox.showerror("Input error",
                                  "GPIB address must be integer; timeout must be float.")
             return
-        self._worker.submit(self._worker.do_connect, port, addr, timeout, eos)
+        self._worker.submit(self._worker.do_connect,
+                            adapter, port, addr, timeout, eos, resource)
 
     def _do_disconnect(self):
         self._worker.submit(self._worker.do_disconnect)

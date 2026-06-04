@@ -1,200 +1,299 @@
-# hp1631a-gpib
+# HP 1631A Logic Analyzer Controller
 
-Python toolkit for remote control, data capture, and waveform export of the
-**HP 1631A / 1631D Logic Analyzer** via a
-[Prologix GPIB-USB](http://prologix.biz/) adapter.
+A Python toolkit for remotely controlling and capturing data from the HP 1631A/D logic analyzer over GPIB. Covers the full workflow from instrument connection through data capture, binary learn string decoding, and export to [PulseView](https://sigrok.org/wiki/PulseView) via the sigrok `.sr` format.
 
-All commands are verified against the *HP 1631A/D Operating & Programming
-Manual*, Chapter 10 ("Using HP-IB or HP-IL Interface").
+All instrument commands are verified against Chapter 10 of the *HP 1631A/D Operating & Programming Manual*.
 
 ---
 
-## Features
+## Files
 
-| Module | Purpose |
+| File | Description |
 |---|---|
-| `hp1631a_extended.py` | Low-level Prologix driver, full HP 1631A instrument driver, binary learn-string parser, high-level capture helpers |
-| `hp1631a_gui.py` | Tkinter GUI — connection panel, CONTROL / CAPTURE / EXPORT / BATCH tabs, canvas waveform viewer, colour-coded log |
-| `hp1631a_to_sr.py` | Converts HP 1631A ASCII listing data to sigrok `.sr` session files for [PulseView](https://sigrok.org/wiki/PulseView) |
-
-**Instrument control**
-- Start (`RN`), Stop (`ST`), Resume (`RE`), and Group Execute Trigger
-- Full menu navigation via Chapter 10 Table 10-1 two-character keyboard mnemonics
-- Serial poll with configurable SRQ mask (`MB` command)
-- Selected Device Clear (SDC) and Interface Clear (IFC) for bus recovery
-- Direct command entry and key-echo buffer read (`KE`)
-
-**Data download**
-- Binary learn strings: `TC` (configuration, ~5145 bytes), `TS` (state), `TT` (timing), `TA` (analog), `TE` (everything)
-- Display read (`DR`) — full 23×64 character screen capture with inverse-video stripping
-- Learn-string header parsing and 16-bit CRC verification
-- Timing data extraction to per-channel sample arrays
-
-**Export**
-- Save captures as raw `.lrn` binary learn-string files
-- CSV export of decoded timing channel data
-- Screen text export (`.txt`)
-- One-step conversion to sigrok `.sr` for PulseView, including multi-bit bus expansion
-
-**GUI extras**
-- Green-phosphor CRT colour theme
-- Canvas-based timing diagram with per-channel colours, zoom slider, and click cursor
-- Step-through connection diagnostics dialog (Prologix firmware check, bus reset, serial poll, EOS sweep, ID variant sweep)
-- Emergency "Clear Stuck Transfer" button for `WARNING Awaiting HP-IB transfer` recovery
-- Settings persistence across sessions (`hp1631a_gui.json`)
-- Batch capture loop with configurable count and inter-capture delay
+| `hp1631a_gui.py` | Tkinter GUI front-end — connection panel, capture tabs, waveform viewer |
+| `hp1631a_extended.py` | Instrument driver and GPIB adapter library |
+| `hp1631a_to_sr.py` | Convert ASCII listing output (screen text via DR) to sigrok `.sr` |
+| `hp1631a_lrn_to_sr.py` | Convert binary TT learn string (`.lrn` file) to sigrok `.sr` |
 
 ---
 
-## Hardware Requirements
+## Requirements
 
-- HP 1631A or 1631D logic analyzer with the HP-IB (GPIB) interface option
-- [Prologix GPIB-USB](http://prologix.biz/) adapter (firmware 6.107+ recommended for `++read_tmo_ms` support; older firmware works with automatic drain)
-- Standard GPIB cable
-- Host PC running Python 3.8+
-
-The instrument's default GPIB address is **5**. Verify or change it via
-`SYSTEM → CONFIG → HP-IB ADDRESS` on the front panel.
-
----
-
-## Software Requirements
+- Python 3.8+
+- [pyserial](https://pypi.org/project/pyserial/) — required for Prologix and USBGpib V2 adapters
+- One of the following depending on your GPIB adapter (see [Adapter Support](#adapter-support)):
+  - `gpib-ctypes` — for NI GPIB-USB-HS / Keithley KUSB-488A via linux-gpib
+  - `python-usbtmc` or `pyvisa` + `pyvisa-py` — for xyphro UsbGpib V1 (USBTMC)
+  - `pyvisa` — for PyVISA-compatible adapters
 
 ```
 pip install pyserial
 ```
 
-The GUI (`hp1631a_gui.py`) requires `tkinter`, which is included with most
-Python distributions. The sigrok converter (`hp1631a_to_sr.py`) uses only the
-Python standard library.
+No additional libraries are needed for the Prologix or USBGpib V2 adapters, or for the converter scripts.
 
 ---
 
-## Quick Start
+## Adapter Support
 
-### GUI
+Five GPIB adapter types are supported. All implement a common `GPIBAdapter` interface, so the instrument driver and GUI are fully adapter-agnostic.
 
-```bash
+| Adapter | Class | Notes |
+|---|---|---|
+| Prologix GPIB-USB | `PrologixGPIB` | Serial `++` protocol. Windows: `COM3`, Linux: `/dev/ttyUSB0` |
+| xyphro USBGpib V2 | `USBGpibV2GPIB` | CDC serial, `!`-command protocol. Linux: `/dev/ttyACM0` |
+| NI GPIB-USB-HS / Keithley KUSB-488A | `NI488GPIB` | Requires `gpib-ctypes` or linux-gpib kernel module |
+| xyphro UsbGpib V1 / any USBTMC device | `USBTmcGPIB` | Requires `python-usbtmc` or PyVISA |
+| Any VISA resource | `PyVisaGPIB` | Pass any VISA resource string; works with NI-VISA or pyvisa-py |
+
+### Linux serial port enumeration
+
+On Linux the GUI automatically discovers GPIB adapter ports by globbing both `/dev/ttyUSB*` (Prologix, CP210x/FTDI) and `/dev/ttyACM*` (USBGpib V2, CDC ACM), sorted ACM-first. No manual entry is needed.
+
+---
+
+## GUI (`hp1631a_gui.py`)
+
+A self-contained Tkinter application. Run it directly:
+
+```
 python hp1631a_gui.py
 ```
 
-1. Select the COM port of your Prologix adapter and set the GPIB address (default 5).
-2. Click **CONNECT**. The online lamp turns green and the instrument ID appears.
-3. Use the **CONTROL** tab to navigate menus, run acquisitions, and download learn strings.
-4. Use the **CAPTURE** tab for a full single-shot capture (config + state + timing + screen text).
-5. Optionally tick *Also export .sr for PulseView* to convert automatically after capture.
+![Green-phosphor CRT color scheme](https://i.imgur.com/placeholder.png)
 
-If the instrument becomes unresponsive (the display shows `WARNING Awaiting HP-IB transfer`),
-click **⚠ CLEAR STUCK TRANSFER (IFC + SDC)** before sending any further commands.
+### Connection bar
 
-### Command line — sigrok conversion
+Select adapter type, serial port (auto-populated), GPIB address (factory default **5**), and timeout. The EOS terminator selector is active only for Prologix. Click **CONNECT** to open the adapter and query instrument ID; the online lamp turns green on success.
 
-```bash
-# Convert a timing listing to PulseView format
-python hp1631a_to_sr.py --input trace_timing.txt --output trace.sr --samplerate 10000000
+### Tabs
 
-# Auto-detect sample rate from timestamp columns
-python hp1631a_to_sr.py --input trace_timing.txt --output trace.sr --samplerate auto
+**CONTROL**
+- **RN** (RUN), **RE** (RESUME), **ST** (STOP) — acquisition control
+- Menu navigation mnemonics (SM, FM, TM, LM, WM) and cursor/scroll keys (CU/CD/CL/CR, RU/RD)
+- Binary learn string download buttons: **TC** (config), **TS** (state), **TT** (timing), **TE** (everything)
+- **READ SCREEN** — reads the current 23×64 display via the DR command
+- **⚠ CLEAR STUCK TRANSFER** — sends IFC + SDC to recover from the "Awaiting HP-IB transfer" state
+- **CONNECTION DIAGNOSTICS** — step-through dialog covering adapter firmware, bus reset, serial poll, EOS sweep (Prologix only), and ID command variants
+- **Direct command** entry with response display
 
-# Preview channels without writing a file
+**CAPTURE**
+- Triggers a full acquisition (RN), waits for Measurement Complete, then downloads TC + TS + TT learn strings and a DR screen read
+- Optionally exports a PulseView `.sr` file alongside the binary `.lrn` files
+- Supports SRQ-based or polled end-of-acquisition detection
+
+**EXPORT**
+- **CAPTURE & EXPORT CSV**: runs a capture and decodes the TT timing learn string to a per-channel CSV file
+- **CONVERT → .sr**: converts any previously saved listing or capture bundle to sigrok format
+- **PROBE FILE**: lists channels and detected sample rate without writing
+
+**BATCH**
+- Captures N traces in a loop with a configurable inter-trace delay
+- Saves each trace as a numbered set of learn string files
+
+### Waveform viewer
+
+A scrollable canvas timing diagram renders decoded TT learn string data with per-channel colour rows, adjustable zoom (1–20 px/sample), a click-to-place sample cursor, and mouse-wheel scrolling.
+
+### Settings persistence
+
+Last-used connection parameters, file paths, and capture options are saved to `hp1631a_gui.json` in the script directory and restored on next launch.
+
+---
+
+## Driver library (`hp1631a_extended.py`)
+
+Can be used independently of the GUI for scripted capture workflows.
+
+### Quick start
+
+```python
+from hp1631a_extended import PrologixGPIB, USBGpibV2GPIB, HP1631A, capture_and_export
+
+# Prologix on Linux
+gpib = PrologixGPIB("/dev/ttyUSB0", gpib_addr=5, timeout=10.0, eos=1)
+
+# USBGpib V2 on Linux
+gpib = USBGpibV2GPIB("/dev/ttyACM0", gpib_addr=5, timeout=10.0)
+
+analyzer = HP1631A(gpib)
+analyzer.set_mask(34)          # enable Measurement Complete + Error SRQ bits
+print(analyzer.identify())     # → "HP1631A" or "HP1631D"
+
+files = capture_and_export(analyzer, "trace")
+# Saves: trace_config.lrn, trace_state.lrn, trace_timing.lrn, trace_screen.txt
+```
+
+### Factory function
+
+```python
+from hp1631a_extended import open_gpib_adapter
+
+gpib = open_gpib_adapter("prologix",  port="/dev/ttyUSB0", gpib_addr=5)
+gpib = open_gpib_adapter("usbgpibv2", port="/dev/ttyACM0", gpib_addr=5)
+gpib = open_gpib_adapter("ni488",     gpib_addr=5)
+gpib = open_gpib_adapter("usbtmc")
+gpib = open_gpib_adapter("pyvisa",    resource="GPIB0::5::INSTR")
+```
+
+### Key HP 1631A facts (from manual Chapter 10)
+
+- Commands terminate with `;`, CR, or LF
+- All keyboard mnemonics are exactly **two characters** (Table 10-1): `RN` = RUN, `ST` = STOP, `RE` = RESUME
+- The SRQ mask byte (`MB` command) defaults to 0 at power-on — serial poll always returns 0 until `MB 34` is sent
+- Data download uses binary learn string commands: **TC** (config), **TS** (state), **TT** (timing), **TA** (analog), **TE** (everything). There is no `SLIST?`, `TLIST?`, `WLIST?`, or `CONFIG?`
+- `DR row col count` reads ASCII text from the 23×64 display buffer
+
+### Binary learn string format (TT timing)
+
+| Bytes | Field |
+|---|---|
+| 0–1 | ASCII header `RT` |
+| 2–3 | Byte count (big-endian uint16) |
+| 4 | Number of timing channels (8 or 16) |
+| 5–6 | Number of valid states (big-endian uint16) |
+| 7–8 | Tracepoint index |
+| 9 | Glitch detect mode |
+| 10 | Sample period index (0–18; see clock table below) |
+| 11 | Sample period units (redundant) |
+| 48–49 | Trigger hit count |
+| 50–51 | Acquisition run count |
+| 52–N | Sample data (1 byte/sample ≤8 ch; 2 bytes/sample >8 ch) |
+| N+1 | Revision code |
+| N+2–N+3 | CRC (16-bit sum, big-endian) |
+
+**Sample period index → clock rate:**
+
+| Index | Period | Rate |
+|---|---|---|
+| 0 | 100 ns | 10 MHz |
+| 1 | 200 ns | 5 MHz |
+| 2 | 500 ns | 2 MHz |
+| 3 | 1 µs | 1 MHz |
+| 4 | 2 µs | 500 kHz |
+| 5 | 5 µs | 200 kHz |
+| 6 | 10 µs | 100 kHz |
+| 7–18 | 20 µs … 100 ms | 50 kHz … 10 Hz |
+
+---
+
+## Binary `.lrn` → PulseView converter (`hp1631a_lrn_to_sr.py`)
+
+Converts a binary TT timing learn string file (produced by the GUI's CAPTURE tab or by calling `gpib.query_binary("TT")` directly) to a sigrok v2 `.sr` session file.
+
+```
+# Convert with auto-detected sample rate from TT header:
+python hp1631a_lrn_to_sr.py trace_timing.lrn
+
+# Specify output path:
+python hp1631a_lrn_to_sr.py trace_timing.lrn -o trace.sr
+
+# Override sample rate:
+python hp1631a_lrn_to_sr.py trace_timing.lrn --samplerate 10000000
+
+# Print header info only (no output file):
+python hp1631a_lrn_to_sr.py trace_timing.lrn --info
+
+# Label the channels:
+python hp1631a_lrn_to_sr.py trace_timing.lrn --channels CLK,MOSI,MISO,CS,D4,D5,D6,D7
+
+# Omit channels that never change:
+python hp1631a_lrn_to_sr.py trace_timing.lrn --skip-static
+```
+
+The `--info` flag prints a full header summary including per-channel toggle counts and edge counts — useful for quickly verifying a capture before converting.
+
+The sample rate is decoded automatically from the TT header clock index table. Use `--samplerate` to override if the instrument was running at a rate not covered by the standard table.
+
+---
+
+## ASCII listing → PulseView converter (`hp1631a_to_sr.py`)
+
+Converts ASCII listing text captured from the HP 1631A display (via the DR command) to sigrok `.sr` format. This is the text path; for binary learn strings use `hp1631a_lrn_to_sr.py` instead.
+
+```
+# Timing listing, explicit sample rate:
+python hp1631a_to_sr.py --input trace_timing.txt --output trace.sr \
+       --samplerate 10000000 --mode timing
+
+# State listing:
+python hp1631a_to_sr.py --input trace_state.txt --output trace.sr \
+       --samplerate 1000000 --mode state
+
+# Capture bundle (all three sections in one file):
+python hp1631a_to_sr.py --input capture.txt --output trace.sr \
+       --samplerate auto
+
+# Preview channels without writing:
 python hp1631a_to_sr.py --input trace_timing.txt --probe
 ```
 
-### Scripted capture
+### Capture bundle format
 
-```python
-from hp1631a_extended import PrologixGPIB, HP1631A, connection_check, capture_and_export
+The GUI's CAPTURE tab saves a bundle file containing all three listing sections separated by markers:
 
-gpib = PrologixGPIB("/dev/ttyUSB0", gpib_addr=5)
-analyzer = HP1631A(gpib)
-
-connection_check(gpib, analyzer)
-files = capture_and_export(analyzer, output_stem="trace_001")
-print(files)
-gpib.close()
 ```
+--- STATE LISTING ---
+...
+--- TIMING LISTING ---
+...
+--- WAVEFORM LISTING ---
+...
+```
+
+When `--mode auto` is used (the default), the converter prefers the TIMING section.
+
+### Sample rate detection
+
+The ASCII listing does not embed the sample rate. Pass `--samplerate <Hz>` to match the timing clock configured on the instrument. Use `--samplerate auto` to attempt detection from timestamp columns (`ns`/`µs`/`ms` suffixes) if present. If auto-detection fails it falls back to 1 MHz with a warning.
+
+### Multi-bit bus expansion
+
+If a listing column contains values wider than 1 bit (e.g. an 8-bit data bus grouped under one label), the converter automatically expands it into individual single-bit channels named `<label>0` … `<label>N`.
 
 ---
 
-## File Overview
+## Workflow summary
 
 ```
-hp1631a_extended.py   Core driver and parser
-hp1631a_gui.py        Tkinter GUI application
-hp1631a_to_sr.py      Sigrok .sr export converter
-hp1631a_gui.json      GUI settings (auto-created on first run)
+HP 1631A  ──GPIB──►  hp1631a_extended.py  ──►  *.lrn  (binary learn strings)
+                               │                  │
+                      hp1631a_gui.py         hp1631a_lrn_to_sr.py
+                               │                  │
+                               └──────────────────┘
+                                        │
+                                    trace.sr
+                                        │
+                                    PulseView
 ```
 
-Capture outputs use a common stem with type suffixes:
-
-```
-<stem>_config.lrn     TC binary learn string (instrument configuration)
-<stem>_state.lrn      TS binary learn string (state acquisition data)
-<stem>_timing.lrn     TT binary learn string (timing acquisition data)
-<stem>_screen.txt     DR display read (ASCII screen text)
-<stem>_timing.csv     Decoded timing channel data (CSV export)
-<stem>.sr             Sigrok session file for PulseView
-```
+1. Connect via `hp1631a_gui.py` or directly via `hp1631a_extended.py`
+2. Run acquisition (RN), wait for Measurement Complete
+3. Download binary learn strings (TC, TS, TT) via CAPTURE tab or `capture_and_export()`
+4. Convert `*_timing.lrn` to `trace.sr` using `hp1631a_lrn_to_sr.py`, or use the GUI's built-in export
+5. Open `trace.sr` in PulseView and apply protocol decoders
 
 ---
 
-## Key Technical Notes
+## Troubleshooting
 
-These points are verified against the HP 1631A/D manual and confirmed on
-hardware; they differ from several commonly circulated examples:
+**"Awaiting HP-IB transfer" on the instrument front panel**  
+This occurs when a configuration-download command (SFORMAT, TFORMAT, STRIGGER, TTRIGGER) is sent without the required data block. Use the **⚠ CLEAR STUCK TRANSFER** button in the CONTROL tab (sends IFC + SDC), or run Steps 1–3 in the Connection Diagnostics dialog.
 
-- **Command terminator:** The instrument accepts `;`, CR, or LF. Prologix `++eos 1` (CR) is correct for most setups.
-- **Mnemonics are exactly two characters** (Table 10-1). `RUN` = `RN`, `STOP` = `ST`. There are no `START`, `STOP`, `SLIST?`, `TLIST?`, `WLIST?`, or `CONFIG?` commands.
-- **Data download is binary.** Use `TC`, `TS`, `TT`, `TA`, `TE` — not text listing commands.
-- **SRQ mask defaults to 0 at power-on.** Send `MB 34` after connecting (bit 1 = Measurement Complete + bit 5 = Error) before serial poll will return meaningful values.
-- **`DATA_READY` is status byte bit 1 (value 2)**, not bit 4.
-- **Display read** (`DR row col count`) returns up to 1472 bytes (23 rows × 64 columns). Characters with bit 7 set are inverse-video; mask with `0x7F` to get plain ASCII.
-- **Group Execute Trigger** (`++trg`) starts acquisition identically to `RN`.
+**Serial poll always returns 0**  
+The SRQ mask byte defaults to 0 at power-on and is cleared by RST. Send `MB 34` after connecting. The driver does this automatically on connect; if it gets lost, reconnect or use the Direct Command entry.
 
----
+**No response to ID command**  
+Verify the HP-IB address on the instrument: SYSTEM → CONFIG → HP-IB ADDRESS (factory default is **5**). Run the Connection Diagnostics EOS sweep (Prologix only) and ID variants steps. Increase timeout to 10 s.
 
-## Diagnostics
+**Prologix firmware older than 6.107**  
+`++read_tmo_ms` is not supported on old firmware; the driver drains the resulting error bytes automatically. Update from [prologix.biz](http://prologix.biz/) if you experience repeated connection issues.
 
-The GUI includes a step-through **Connection Diagnostics** dialog
-(`CONTROL → ⚑ CONNECTION DIAGNOSTICS`) that runs:
-
-1. Prologix firmware version check (warns if < 6.107)
-2. Bus reset (IFC + SDC)
-3. Serial poll — confirms GPIB address and cabling
-4. EOS terminator sweep — tries CR+LF / CR / LF / None in sequence
-5. ID command variants — `ID`, `ID?`, `*IDN?`
+**Linux: port not appearing in the dropdown**  
+The GUI globs `/dev/ttyACM*` and `/dev/ttyUSB*` directly. If the device still doesn't appear, check `dmesg | tail` after plugging in. You may need to add yourself to the `dialout` group: `sudo usermod -aG dialout $USER` (then log out and back in).
 
 ---
 
 ## License
 
-MIT License
-
-Copyright (c) 2025
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
----
-
-## References
-
-- *HP 1631A/D Logic Analyzer Operating & Programming Manual* — Chapter 10, "Using HP-IB or HP-IL Interface"
-- [Prologix GPIB-USB Controller](http://prologix.biz/)
-- [sigrok / PulseView](https://sigrok.org/)
-- [Sigrok .sr v2 file format](https://sigrok.org/wiki/File_format:Sigrok/v2)
+MIT
