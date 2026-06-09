@@ -77,6 +77,13 @@ try:
 except ImportError:
     HAS_SR = False
 
+# ── hp1631a_lrn_to_sr ───────────────────────────────────────────────────────
+try:
+    from hp1631a_lrn_to_sr import convert as convert_lrn_to_sr
+    HAS_LRN_SR = True
+except ImportError:
+    HAS_LRN_SR = False
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Palette  —  green-phosphor CRT
 # ═══════════════════════════════════════════════════════════════════════════
@@ -486,6 +493,17 @@ class Worker(threading.Thread):
         if not self._ready(): return
         self._status("Capturing…")
         self._log("── Capture ───────────────────────────────────", "section")
+
+        # Re-assert SRQ mask and log current status before starting
+        self.gpib.write("MB 34")
+        time.sleep(0.15)
+        sb_pre = self.gpib.serial_poll()
+        self._log(
+            f"Pre-RN status byte: 0x{sb_pre:02X}  "
+            f"MEAS_COMPLETE={bool(sb_pre & HP1631A.SB_MEASUREMENT_COMPLETE)}  "
+            f"NOT_BUSY={bool(sb_pre & HP1631A.SB_NOT_BUSY)}  "
+            f"ERROR={bool(sb_pre & HP1631A.SB_ERROR)}", "info")
+
         self._log("START →", "cmd")
         self.gpib.write("RN")
         self._cancel.clear()
@@ -499,6 +517,12 @@ class Worker(threading.Thread):
             self._log(msg, "error")
             self._status("Ready")
             return
+
+        sb_post = self.gpib.serial_poll()
+        self._log(
+            f"Post-wait status byte: 0x{sb_post:02X}  "
+            f"MEAS_COMPLETE={bool(sb_post & HP1631A.SB_MEASUREMENT_COMPLETE)}  "
+            f"NOT_BUSY={bool(sb_post & HP1631A.SB_NOT_BUSY)}", "info")
 
         self._status("Downloading learn strings…")
         stem = path.rsplit(".", 1)[0] if "." in path else path
@@ -555,19 +579,48 @@ class Worker(threading.Thread):
 
         self._log(f"Capture complete. {len(files_saved)} file(s) saved.", "good")
 
-        if also_sr and HAS_SR:
-            sr_path = os.path.splitext(path)[0] + ".sr"
+        if also_sr:
+            sr_path = stem + ".sr"
             self._status("Converting to .sr…")
             self._log("Converting to sigrok .sr…", "info")
-            with open(path) as f:
-                txt = f.read()
-            ok2 = convert_to_sr(txt, sr_path, "auto", str(sr_rate))
-            self._log(f"Sigrok: {sr_path}" if ok2 else "SR conversion failed.", 
-                      "good" if ok2 else "error")
+            lrn_path = stem + "_timing.lrn"
+            ok2 = False
+            if HAS_LRN_SR and os.path.exists(lrn_path):
+                # Preferred: binary learn string → .sr (no sample rate needed,
+                # decoded automatically from TT header)
+                ok2 = convert_lrn_to_sr(
+                    lrn_path=lrn_path,
+                    output_path=sr_path,
+                )
+            elif HAS_SR:
+                # Fallback: ASCII screen text → .sr (requires user-supplied rate)
+                screen_path = stem + "_screen.txt"
+                if os.path.exists(screen_path):
+                    with open(screen_path, encoding="utf-8", errors="replace") as f:
+                        txt = f.read()
+                    ok2 = convert_to_sr(txt, sr_path, "auto", str(sr_rate))
+                else:
+                    self._log("SR fallback: screen text file not found.", "error")
+            else:
+                self._log(
+                    "hp1631a_lrn_to_sr.py not found — cannot convert to .sr.  "
+                    "Place it in the same directory as this script.",
+                    "error")
+            if ok2:
+                self._log(f"Sigrok: {sr_path}", "good")
+            elif HAS_LRN_SR or HAS_SR:
+                # Try to give a more specific reason than "failed"
+                if os.path.exists(lrn_path) and os.path.getsize(lrn_path) < 60:
+                    self._log(
+                        "SR conversion failed: timing learn string is too short "
+                        f"({os.path.getsize(lrn_path)} bytes) — "
+                        "States=0 means no data was captured. "
+                        "Check that the trigger fired and the acquisition completed.",
+                        "error")
+                else:
+                    self._log("SR conversion failed — check log output above.", "error")
 
-        # Push listing to waveform panel (prefer timing, fall back to state)
-        listing_for_display = tlist if tlist.strip() else slist
-        self.log_q.put(("listing_data", listing_for_display))
+        # screen_text was already queued to the waveform panel above
         self._log("── Capture complete ──────────────────────────", "section")
         self._status("Ready")
 
@@ -723,6 +776,102 @@ class Worker(threading.Thread):
         """Legacy stub — read current screen display instead."""
         if not self._ready(): return
         self.do_display_read()
+
+    def do_verify_acquisition(self):
+        """
+        Step-by-step acquisition state verification.
+        Checks SRQ mask, serial polls, then does a raw TT download and
+        dumps the first bytes so the caller can see exactly what arrived.
+        """
+        if not self._ready(): return
+        self._log("── Verify Acquisition ────────────────────────", "section")
+
+        # Step 1: current status byte without touching MB
+        sb = self.gpib.serial_poll()
+        self._log(
+            f"Step 1 — Serial poll (current MB):  0x{sb:02X}  "
+            f"MEAS_COMPLETE={bool(sb & HP1631A.SB_MEASUREMENT_COMPLETE)}  "
+            f"NOT_BUSY={bool(sb & HP1631A.SB_NOT_BUSY)}  "
+            f"ERROR={bool(sb & HP1631A.SB_ERROR)}  "
+            f"SRQ={bool(sb & HP1631A.SB_SRQ)}", "info")
+
+        # Step 2: set MB 34 and re-poll
+        self.gpib.write("MB 34")
+        time.sleep(0.2)
+        sb2 = self.gpib.serial_poll()
+        self._log(
+            f"Step 2 — After MB 34, serial poll:  0x{sb2:02X}  "
+            f"MEAS_COMPLETE={bool(sb2 & HP1631A.SB_MEASUREMENT_COMPLETE)}  "
+            f"NOT_BUSY={bool(sb2 & HP1631A.SB_NOT_BUSY)}  "
+            f"ERROR={bool(sb2 & HP1631A.SB_ERROR)}", "info")
+
+        if sb2 & HP1631A.SB_MEASUREMENT_COMPLETE:
+            self._log("  → Measurement Complete flag IS set — data should be ready.", "good")
+        elif sb2 & HP1631A.SB_NOT_BUSY:
+            self._log("  → NOT_BUSY set but MEAS_COMPLETE not set — "
+                      "acquisition may not have run or trigger not met.", "error")
+        else:
+            self._log("  → Neither flag set — instrument may still be acquiring "
+                      "or MB mask was cleared.", "error")
+
+        # Step 3: raw TT download and hex dump of first 64 bytes
+        self._log("Step 3 — Sending TT and reading raw bytes…", "info")
+        self.gpib.write("TT")
+        time.sleep(2.0)
+        raw = self.gpib.read_binary(max_bytes=65536)
+        self._log(f"  Raw bytes received: {len(raw)}", "info")
+
+        if len(raw) == 0:
+            self._log("  → Nothing received. Check GPIB address, cable, and "
+                      "that the instrument is in Remote mode.", "error")
+        elif len(raw) < 4:
+            self._log(f"  → Only {len(raw)} byte(s): {raw.hex()}  "
+                      "(too short for a valid learn string header)", "error")
+        else:
+            header = raw[0:2]
+            byte_count = (raw[2] << 8) | raw[3]
+            expected_total = 4 + byte_count
+            self._log(
+                f"  Header       : {header!r}  "
+                f"({'RT = timing ✓' if header == b'RT' else 'NOT RT — wrong learn string type!'})",
+                "good" if header == b"RT" else "error")
+            self._log(
+                f"  Byte count   : {byte_count}  "
+                f"(total expected: {expected_total},  received: {len(raw)})", "info")
+
+            if len(raw) >= 6:
+                n_ch     = raw[4]
+                n_states = (raw[5] << 8) | raw[6]
+                self._log(f"  Channels     : {n_ch}", "info")
+                self._log(
+                    f"  Valid states : {n_states}  "
+                    f"({'data present ✓' if n_states > 0 else '← ZERO — no sample data in buffer'})",
+                    "good" if n_states > 0 else "error")
+                if len(raw) >= 11:
+                    clock_idx = raw[10]
+                    clocks = [
+                        "100ns/10MHz","200ns/5MHz","500ns/2MHz","1µs/1MHz",
+                        "2µs/500kHz","5µs/200kHz","10µs/100kHz","20µs/50kHz",
+                        "50µs/20kHz","100µs/10kHz","200µs/5kHz","500µs/2kHz",
+                        "1ms/1kHz","2ms/500Hz","5ms/200Hz","10ms/100Hz",
+                        "20ms/50Hz","50ms/20Hz","100ms/10Hz",
+                    ]
+                    clk_str = clocks[clock_idx] if clock_idx < len(clocks) else f"index {clock_idx} (unknown)"
+                    self._log(f"  Clock index  : {clock_idx} → {clk_str}", "info")
+
+            dump = " ".join(f"{b:02X}" for b in raw[:64])
+            remaining = f"  … (+{len(raw)-64} more)" if len(raw) > 64 else ""
+            self._log(f"  First 64 bytes: {dump}{remaining}", "info")
+
+            if len(raw) < expected_total:
+                self._log(
+                    f"  ⚠ Transfer appears truncated: got {len(raw)} of {expected_total} expected bytes. "
+                    "Try increasing adapter timeout.", "error")
+            elif len(raw) >= expected_total:
+                self._log("  Transfer length matches header byte count ✓", "good")
+
+        self._log("── Verify complete ───────────────────────────", "section")
+        self._status("Ready")
 
     def do_learn_string(self, cmd: str):
         """Download a binary learn string (TC, TS, TT, or TE)."""
@@ -1655,6 +1804,9 @@ class App(tk.Tk):
             self._worker.do_get_timing),   w=12).pack(side="left", padx=(0,4))
         self._btn(row3, "GET WAVEFORM",lambda: self._worker.submit(
             self._worker.do_get_waveform), w=12).pack(side="left")
+        self._btn(f, "🔍  VERIFY ACQUISITION", lambda: self._worker.submit(
+            self._worker.do_verify_acquisition), w=24,
+                  ).pack(padx=6, pady=(0,4), fill="x")
 
         self._section(f, "INSTRUMENT CONFIGURATION")
         row4 = tk.Frame(f, bg=BG2); row4.pack(fill="x", padx=6, pady=3)
