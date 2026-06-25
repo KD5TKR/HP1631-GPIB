@@ -1,0 +1,18 @@
+* f9dasm control file for HP 1631A ROM B0060  overlay
+* Base $8000 (overlay window); head LBSR;RTS trampolines -> public entries.
+setdp 8000-BFFF 00
+
+label 8000 B0060_trampolines
+
+* code-referenced strings (FCC)
+fcc 8017-801C
+fcc 870F-8712
+fcc 886C-887B
+fcc 9458-9465
+fcc 9466-9473
+fcc 9474-9481
+fcc A057-A05C
+fcc A15F-A164
+fcc B142-B149
+fcc BF2C-BF35
+fcc BF2D-BF35

@@ -1,0 +1,76 @@
+* f9dasm control file for HP 1631A UI/menu ROM B0059 (01630-80059, chip5/U4J)
+* Base $8000 (operate-mode low-half mapping; off X -> logical $8000+X).
+* Measurement/menu UI: labels for Sample Period, Trigger, Histogram, etc.
+* Code anchors = emulator coverage (operate mode); text runs marked FCC.
+setdp 8000-BFFF 00
+
+* ---- confirmed-code anchors (emulator coverage, operate mode) ----
+label 969F uic_969F
+label 9738 uic_9738
+label 977C uic_977C
+label 97D4 uic_97D4
+label 9833 uic_9833
+label 9843 uic_9843
+label 9853 uic_9853
+label 9876 uic_9876
+label 9896 uic_9896
+label 98C0 uic_98C0
+label 98E6 uic_98E6
+label 9941 uic_9941
+label 995C uic_995C
+
+* ---- UI text / string tables (FCC data) ----
+fcc 85A4-85AD
+fcc 8924-8929
+fcc 8A4F-8A57
+fcc 8D38-8D53
+fcc 8D55-8D5D
+fcc 8D5F-8D67
+fcc 9296-92A6
+fcc 9B50-9B5B
+fcc 9B5D-9B67
+fcc A032-A03F
+fcc A058-A065
+fcc A069-A076
+fcc A07A-A087
+fcc A0F6-A100
+fcc A107-A10D
+fcc A111-A11E
+fcc A122-A130
+fcc A140-A14E
+fcc A16B-A176
+fcc A18C-A198
+fcc A1A2-A1AC
+fcc A1C9-A1D5
+fcc A1E4-A1EB
+fcc A1F0-A1F9
+fcc A20E-A21C
+fcc A22E-A23A
+fcc A269-A272
+fcc A274-A282
+fcc A7D6-A7E1
+fcc A895-A8A2
+fcc A91F-A924
+fcc AB34-AB3E
+fcc ABC7-ABD1
+fcc ABD3-ABDD
+fcc AC63-AC71
+fcc ACB9-ACC9
+fcc ACCB-ACDA
+fcc AE7C-AE83
+fcc AEC2-AEC7
+fcc AF3F-AF46
+fcc AF48-AF4F
+fcc AF51-AF57
+fcc AF59-AF62
+fcc B0CC-B0DD
+fcc B0DF-B0EE
+fcc B0F0-B0FF
+fcc B101-B110
+fcc B112-B121
+fcc B123-B132
+fcc B134-B143
+fcc B145-B154
+fcc B7AF-B7B5
+fcc B7FA-B807
+fcc BEBB-BEC2

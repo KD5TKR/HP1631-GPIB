@@ -1,0 +1,118 @@
+* f9dasm control file for HP 1631A disc/HP-IB ROM B0055 (01630-80055, chip1/U3J)
+* Base $8000 (overlay window). Head = LBSR;RTS trampolines -> public entries.
+* Low half: disc/HP-IB code + message catalog. High half ($A000-$BFFF): config-menu templates.
+setdp 8000-BFFF 00
+
+label 8000 b0055_trampolines
+label 814F entry_814F
+label 8014 entry_8014
+label 80E0 entry_80E0
+label 81AD entry_81AD
+
+* high half = config-menu templates/strings (data)
+data A000-BFEF
+
+* string/message FCC (disc message catalog + menu labels)
+fcc 8149-814E
+fcc 834F-8364
+fcc 8365-8377
+fcc 8378-838B
+fcc 838C-839F
+fcc 83A0-83B5
+fcc 83B6-83C8
+fcc 83C9-83DC
+fcc 83DD-83F0
+fcc 83F1-840A
+fcc 840B-841D
+fcc 874B-8760
+fcc 8761-8775
+fcc 8776-878B
+fcc 878C-87A1
+fcc 87A2-87AE
+fcc 87AF-87BD
+fcc 87BE-87CE
+fcc 87CF-87E9
+fcc 87EA-87F8
+fcc 87F9-8808
+fcc 8809-881D
+fcc 881E-8835
+fcc 8836-884F
+fcc 8850-8865
+fcc 8866-8872
+fcc 8873-8883
+fcc 8884-8891
+fcc 8892-88A0
+fcc 88A1-88B3
+fcc 88B4-88C4
+fcc 88C5-88DC
+fcc 88DD-88F6
+fcc 8A03-8A08
+fcc 8A09-8A18
+fcc 8A19-8A2B
+fcc 9697-96A8
+fcc 96A9-96BB
+fcc 9D80-9D85
+fcc A089-A090
+fcc A092-A09B
+fcc A09E-A0A3
+fcc A0A5-A0AB
+fcc A0AF-A0B7
+fcc A0B9-A0C1
+fcc A0D9-A0E3
+fcc A0F7-A10A
+fcc A10D-A115
+fcc A123-A138
+fcc A1D2-A1D9
+fcc A1DD-A1E2
+fcc A1EC-A208
+fcc A20F-A21F
+fcc A226-A22D
+fcc A235-A240
+fcc A243-A24B
+fcc A252-A25C
+fcc A261-A26D
+fcc A277-A282
+fcc A286-A290
+fcc A29B-A2A4
+fcc A2C4-A2C8
+fcc A2EA-A2F1
+fcc A2FD-A30D
+fcc A319-A329
+fcc A34F-A358
+fcc A3D2-A3DE
+fcc A418-A423
+fcc A47F-A48B
+fcc A51A-A524
+fcc A537-A540
+fcc A550-A555
+fcc A556-A55F
+fcc A566-A571
+fcc A574-A584
+fcc A58D-A592
+fcc A5A7-A5AD
+fcc A5B4-A5B9
+fcc A5DE-A5E4
+fcc A61A-A624
+fcc A637-A640
+fcc A647-A64E
+fcc A65D-A667
+fcc A690-A697
+fcc A6A6-A6B1
+fcc A6B4-A6BF
+fcc A6D6-A6DF
+fcc B2F7-B302
+fcc B36A-B373
+fcc B3DC-B3F5
+fcc B3F6-B411
+fcc B412-B42C
+fcc B42D-B442
+fcc B443-B459
+fcc B45A-B470
+fcc B491-B49E
+fcc B49F-B4AB
+fcc B6E1-B6E9
+fcc B7DB-B7E3
+fcc B93C-B941
+fcc B943-B949
+fcc B94A-B955
+fcc BC4C-BC52

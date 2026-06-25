@@ -1,0 +1,40 @@
+* f9dasm control file for HP 1631A ROM B0056  analog subsystem
+* Base $8000 (overlay window); head LBSR;RTS trampolines -> public entries.
+setdp 8000-BFFF 00
+
+label 8000 B0056_trampolines
+label 86E8 entry_86E8
+label 8F08 entry_8F08
+label 8095 entry_8095
+label 813E entry_813E
+
+* code-referenced strings (FCC)
+fcc 808A-8091
+fcc 86C8-86EC
+fcc 86DB-86EC
+fcc 911F-9125
+fcc 9126-912C
+fcc 912D-9135
+fcc 9136-913C
+fcc 913D-9140
+fcc 9357-9364
+fcc 9365-9370
+fcc 939F-93A5
+fcc 93D9-93E1
+fcc 98AB-98B0
+fcc 9BC9-9BDD
+fcc AFC5-AFDD
+fcc AFDE-AFEB
+fcc AFE4-AFEB
+fcc AFEC-AFFB
+fcc B000-B00A
+fcc B191-B19B
+fcc B19C-B1A6
+fcc B1A7-B1B0
+fcc B1F1-B219
+fcc B6C5-B6C8
+fcc BC5D-BC65
+fcc BCA2-BCB4
+fcc BCB5-BCC7
+fcc BCC8-BCD9
+fcc BD0B-BD1A

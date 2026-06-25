@@ -1,0 +1,94 @@
+* f9dasm control file for HP 1631A state/timing config-menu ROM B0057 (chip3/U3H)
+* Base $8000 (overlay window). Head = LBSR;RTS trampoline table -> public entries.
+* Low half = menu logic code; high half ($A000-$BFFF) = display-list templates + strings.
+setdp 8000-BFFF 00
+
+* ---- public entry points (exposed via head trampolines) ----
+label 8000 b0057_trampolines
+label 848E entry_848E
+label 81D4 entry_81D4
+label 83E8 entry_83E8
+label 9410 entry_9410
+
+* ---- high half = menu templates / string tables (data) ----
+data A000-BFEF
+
+* ---- readable label/string FCC overrides ----
+fcc A052-A05C
+fcc A06E-A07A
+fcc A082-A089
+fcc A0A3-A0B2
+fcc A0C4-A0DC
+fcc A0F8-A105
+fcc A143-A150
+fcc A166-A16D
+fcc A170-A177
+fcc A1C3-A1D2
+fcc A1E4-A1FC
+fcc A218-A225
+fcc A257-A25F
+fcc A263-A270
+fcc A274-A27B
+fcc A294-A2A7
+fcc A2C4-A2D1
+fcc A2DE-A2F4
+fcc A301-A31F
+fcc A342-A356
+fcc A380-A386
+fcc A387-A38D
+fcc A4EC-A4F1
+fcc A4F4-A4FB
+fcc A55D-A562
+fcc A563-A569
+fcc A56A-A570
+fcc A578-A57B
+fcc A59B-A5A7
+fcc A5A8-A5B5
+fcc A742-A74A
+fcc A855-A864
+fcc A865-A86D
+fcc A9ED-A9F2
+fcc A9F3-A9F9
+fcc AA0E-AA1E
+fcc AA1F-AA30
+fcc AA31-AA41
+fcc AA42-AA53
+fcc AA54-AA64
+fcc AA65-AA6F
+fcc AA80-AA83
+fcc AAA9-AAB0
+fcc AAB1-AAB4
+fcc AAB5-AAB8
+fcc AAB9-AABE
+fcc AABF-AAC6
+fcc AAC7-AAD2
+fcc AAD3-AAE4
+fcc AAE5-AAF5
+fcc AB01-AB08
+fcc AB09-AB0F
+fcc AD39-AD41
+fcc AD52-AD5E
+fcc AD5F-AD68
+fcc B010-B01B
+fcc B01C-B027
+fcc B028-B02C
+fcc B02D-B031
+fcc B032-B03F
+fcc B040-B049
+fcc B04A-B059
+fcc B050-B059
+fcc B05A-B064
+fcc B065-B078
+fcc B079-B07C
+fcc B07D-B08C
+fcc B08D-B09B
+fcc B0A6-B0AF
+fcc B0C4-B0CD
+fcc B0CE-B0D6
+fcc B7DB-B7E1
+fcc B7E2-B7EC
+fcc B7ED-B7F4
+fcc B7F5-B7FD
+fcc B967-B96E
+fcc B96F-B979
+fcc B97E-B985

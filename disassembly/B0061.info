@@ -1,0 +1,67 @@
+* f9dasm control file for HP 1630/1631A kernel ROM B0061 (01630-80061, chip7/U4H)
+* Disassembled at base $C000 (file off X -> logical $C000+X); resident kernel = $F000-$FFFF.
+* Entry spine = main_entry $F089 (called at end of init_hw); plus reset + IRQ vectors.
+* Labels/comments from emulation-driven RE (see ../annotations/B0061_labels.txt, ../RE_NOTES.md).
+
+* ---- direct page (kernel runs with DP=0) ----
+setdp C000-FFFF 00
+
+* ---- entry vectors (flow-followed) ----
+* known sub-entries (reached via indirect/computed calls)
+
+* ---- labels ----
+label F089 main_entry
+label FD80 RESET
+label FDC8 init_hw
+label FEB4 init_tail
+label FEB9 struct_clear
+label F31F init_sub_F31F
+label F37B post_ramtest
+label F412 post_romchecksum
+label F3E4 romchk_bankloop
+label F420 romchk_compare
+label F441 post_clear_A
+label F451 post_clear_B
+label F45B display_init
+label F4A9 disp_vsync_test
+label F4B7 disp_init_cont
+label F500 selftest_orch
+label F530 display_hex_byte
+label F54F display_string
+label F600 setup_operational_map
+label F637 mmu_set_page
+label F664 clear_mem
+label F6C3 pre_reset_sub
+label F6C4 selftest_result_disp
+label F6FA vsync_wait
+label F701 post_delay
+label F70F reboot
+label F084 isr_swi
+label FADB isr_irq
+label FBBD isr_nmi
+label FBA3 isr_firq
+
+* ---- data regions ----
+word FD88-FDC7   * mmu_boot_table: 32x16b page-map (copied to $FF00)
+data F07C-F083   * romchk_expected_tbl: 8 per-bank checksum bytes
+data F66F-F6B1   * self-test result strings/tables
+fcc  F6B2-F6C2   * "SELF TEST PASSED" (00-terminated)
+word FFF0-FFFF   * 6809 vector table (reserved,SWI3,SWI2,FIRQ,IRQ,SWI,NMI,RESET)
+label FFFE vec_RESET
+label FFFC vec_NMI
+label FFF8 vec_IRQ
+label FFF6 vec_FIRQ
+
+* ---- explanatory line comments ----
+lcomment F089 main_entry: top of the application/dispatch (boot flows here from init_hw)
+lcomment FDC8 init_hw: mask ints, copy 64B MMU map FD88->$FF00, init CRTC/8279, LDS #$E1FD
+lcomment FD88 initial MMU page map (32 x 16-bit: attr<<8 | phys 2KB-page)
+lcomment F37B POST RAM test: walk DRAM phys pages $280-$29F via reg0, walking-bit pattern
+lcomment F412 POST ROM checksum: sum logical $0000-$3FFF per bank, CMPA vs $F07C table
+lcomment F45B program MC6845 CRTC ($E032-$E038) + 8279 ($E848-$E84F)
+lcomment F4A9 read $E852 bit2 (CRT vsync: 1=active) to gate display init
+lcomment F600 reprogram MMU into operational map (kernel low, overlays $6000-$BFFF)
+lcomment F637 mmu_set_page: write $FF00-region page registers (A=logical page, X=phys)
+lcomment F6C4 copy SELF-TEST result strings into CRT RAM $D00E/$D012 (row stride $17)
+lcomment F6FA spin while $E852 bit2 set (wait CRT retrace)
+lcomment F70F JMP [$FFFE]: re-enter RESET (self-test loops; unconditional)

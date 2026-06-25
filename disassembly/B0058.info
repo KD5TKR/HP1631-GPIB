@@ -1,0 +1,66 @@
+* f9dasm control file for HP 1631A ROM B0058  acquisition + listing
+* Base $8000 (overlay window); head LBSR;RTS trampolines -> public entries.
+setdp 8000-BFFF 00
+
+label 8000 B0058_trampolines
+
+* code-referenced strings (FCC)
+fcc 8746-875A
+fcc 874B-875A
+fcc 8750-875A
+fcc 893F-8942
+fcc 8943-8946
+fcc 8947-894A
+fcc 894B-894E
+fcc 8A90-8A95
+fcc 8A96-8A9C
+fcc 8A9D-8AA3
+fcc 8AA4-8AB1
+fcc 9029-9030
+fcc 9E59-9E66
+fcc A2B0-A2B6
+fcc A829-A82E
+fcc A82F-A834
+fcc A835-A83F
+fcc A840-A84A
+fcc A84B-A854
+fcc AA98-AA9F
+fcc B004-B023
+fcc B024-B044
+fcc B045-B063
+fcc B064-B083
+fcc B084-B08B
+fcc B20F-B217
+fcc B218-B21F
+fcc B220-B227
+fcc B234-B238
+fcc B245-B24B
+fcc B24C-B250
+fcc B254-B25E
+fcc B35F-B372
+fcc B373-B37A
+fcc B37B-B382
+fcc B383-B39F
+fcc B3A0-B3B0
+fcc B3B1-B3C5
+fcc B77B-B786
+fcc B832-B83A
+fcc B83B-B843
+fcc B844-B84C
+fcc B87B-B87F
+fcc B880-B884
+fcc B895-B898
+fcc B92D-B932
+fcc B933-B939
+fcc B9B2-B9BA
+fcc B9E1-B9E6
+fcc BBC1-BBC8
+fcc BBD3-BBD7
+fcc BC0E-BC17
+fcc BC18-BC20
+fcc BC28-BC30
+fcc BC3F-BC46
+fcc BCE0-BCEE
+fcc BCEF-BCF9
+fcc BCFA-BD02
+fcc BD03-BD1E

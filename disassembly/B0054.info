@@ -1,0 +1,63 @@
+* HP 1631A B0054 — prompt/error/status MESSAGE ROM (base $8000)
+* Mostly data: banner + message catalog; high half = message/template data.
+setdp 8000-BFFF 00
+
+data A000-BFEF
+
+fcc 8000-800A
+fcc 8002-800A
+fcc 9BC8-9BCF
+fcc 9BD0-9BDB
+fcc 9BDC-9BF5
+fcc 9BE1-9BF5
+fcc 9BE6-9BF5
+fcc 9BEB-9BF5
+fcc 9F00-9F17
+fcc 9F05-9F17
+fcc 9F0A-9F17
+fcc 9F0F-9F17
+fcc B7AA-B7BB
+fcc B7C6-B7D5
+fcc B7DA-B7EB
+fcc B7F0-B80B
+fcc B810-B81D
+fcc B822-B830
+fcc B850-B866
+fcc B86B-B877
+fcc B87C-B891
+fcc B8AF-B8C8
+fcc B997-B9A9
+fcc B9AE-B9C8
+fcc B9CD-B9D8
+fcc B9DD-B9EE
+fcc BA8B-BAA6
+fcc BAAB-BAC3
+fcc BAC8-BAE6
+fcc BAEB-BB0A
+fcc BB0F-BB27
+fcc BB60-BB7C
+fcc BB9E-BBB0
+fcc BBF4-BC05
+fcc BC45-BC56
+fcc BC76-BC88
+fcc BC8D-BCA3
+fcc BCA8-BCB6
+fcc BCE0-BCEC
+fcc BCF1-BD06
+fcc BD0B-BD22
+fcc BD27-BD3B
+fcc BD57-BD71
+fcc BDCA-BDDF
+fcc BE03-BE1F
+fcc BE37-BE47
+fcc BE4C-BE5D
+fcc BE62-BE7C
+fcc BE81-BE8F
+fcc BEB8-BEC8
+fcc BECD-BEE0
+fcc BEE5-BEFF
+fcc BF04-BF1D
+fcc BF22-BF2E
+fcc BF33-BF3D
+fcc BF42-BF5F
+fcc BF64-BF7B
