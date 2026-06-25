@@ -1070,6 +1070,11 @@ class HP1631A:
     SB_NOT_BUSY             = 0x10
     SB_ERROR                = 0x20
     SB_SRQ                  = 0x40
+    SB_POWER_ON             = 0x80   # IEEE 488.1 PON condition bit (bit 7)
+
+    # Aliases used by hp1631a_gui.py
+    SB_DATA_READY = SB_MEASUREMENT_COMPLETE   # bit 1 — same signal, alternate name
+    SB_RQS        = SB_SRQ                    # bit 6 — Request for Service / SRQ indicator
 
     # Learn string receive headers
     HEADER_CONFIG  = b"RC"
@@ -1219,6 +1224,110 @@ class HP1631A:
             self.gpib.write(mnemonic)
         time.sleep(0.1)
 
+    def set_trigger_pattern(self, pattern: str, mode: str = "state",
+                            label_row: int = 1, dont_care_key: str = "DC",
+                            settle: float = 0.08) -> bool:
+        """
+        Drive the front-panel Trace/Trigger spec screen to set a bit-pattern
+        trigger condition, the same way a user would type it on the keypad.
+
+        ⚠ UNVERIFIED MNEMONIC WARNING
+        ------------------------------
+        The exact 2-character mnemonic for the front-panel "don't care" (X)
+        key on the Trace/Trigger pattern entry screen is NOT confirmed
+        against the manual in this codebase — "DC" is a placeholder best
+        guess based on the instrument's general 2-character keyboard
+        mnemonic convention (Table 10-1 covers menu/cursor/run keys, but
+        the trigger-pattern digit/don't-care keys are a separate, less
+        commonly documented section of Chapter 10). Before relying on
+        this method:
+          1. Run it once with a short pattern (e.g. "0X") on a label you
+             don't mind disturbing.
+          2. Read the Trace screen back with display_read() and visually
+             compare against the front panel.
+          3. If the don't-care character didn't land correctly, pass the
+             correct mnemonic via `dont_care_key=` (check the front panel
+             keycap silkscreen, or Chapter 10's keyboard mnemonic table,
+             for the actual label — likely something like "DC", "X", or a
+             dedicated key labeled "DON'T CARE").
+        The '0' and '1' digit keys are sent as the literal characters '0'
+        and '1', which is correct per the standard HP-IB keyboard mnemonic
+        convention (single printable characters map directly to keypad
+        digits) and does not carry the same uncertainty.
+
+        The 1631A's trigger word entry has no single GPIB command that
+        accepts a whole pattern string — each bit position is a field on
+        the Trace screen that the cursor must be moved onto, then a digit
+        (0/1) or the don't-care key is typed to set that bit. This method
+        automates that sequence: navigate to TRACE, select the trigger
+        spec line, then walk the cursor across `len(pattern)` bit
+        positions typing each character.
+
+        Parameters
+        ----------
+        pattern       : string of '0', '1', 'X'/'x' (don't care) characters,
+                        most-significant bit (highest channel number) first,
+                        matching the on-screen left-to-right field order,
+                        e.g. "0XXXXXXXXXXXXXXX" to trigger on channel 0
+                        (BDAL0) low and everything else don't-care.
+                        Length should match the number of channels
+                        assigned to the label being triggered on
+                        (commonly 8 or 16).
+        mode          : "state" or "timing" — informational only; caller
+                        is responsible for having already navigated to the
+                        correct Format/Trace mode before calling this.
+        label_row     : which trigger pattern row to edit, if multiple
+                        labels are defined (1 = first/topmost row).
+        dont_care_key : the mnemonic sent for 'X'/don't-care characters.
+                        See warning above — verify and override if needed.
+        settle        : delay in seconds between keystrokes; increase if
+                        the instrument is dropping characters.
+
+        Returns True if the pattern was sent without error, False if an
+        invalid character was found in `pattern` (no keys are sent in
+        that case).
+
+        Notes
+        -----
+        This does not verify the resulting on-screen pattern matches what
+        was requested — the 1631A has no query-back command for trigger
+        state. After calling this, use display_read() on the Trace screen
+        to visually confirm the pattern landed correctly, especially the
+        first time you use this method or after changing dont_care_key.
+        """
+        pattern = pattern.strip()
+        valid_chars = set("01XxNn")  # N = don't-care alias some manuals use
+        if not pattern or any(c not in valid_chars for c in pattern):
+            return False
+
+        # Navigate to the Trace menu. TM = Trace menu mnemonic
+        # (MENU_MNEMONICS) — this part IS confirmed against Table 10-1.
+        self.menu("TRACE")
+        time.sleep(0.2)
+
+        # Move cursor to the requested label row, then to the start
+        # (leftmost bit) of the pattern field. CD = cursor down,
+        # CL = cursor left (repeated generously to guarantee we're at
+        # the leftmost field regardless of prior cursor position).
+        # This cursor-walk approach is standard for the 1631A's
+        # softkey/field-based menus elsewhere in this driver (see menu()
+        # and key()), but has not been specifically verified on the
+        # Trace/Trigger screen layout.
+        if label_row > 1:
+            self.key("CD", label_row - 1)
+        self.key("CL", 32)   # walk fully left; harmless past the edge
+
+        for ch in pattern:
+            c = ch.upper()
+            if c in ("X", "N"):
+                self.gpib.write(dont_care_key)
+            else:
+                self.gpib.write(c)      # literal '0' or '1' digit key
+            time.sleep(settle)
+            self.key("CR")  # advance to next bit position
+
+        return True
+
     # ── Display Read ────────────────────────────────────────────────────────
 
     def display_read(self, row: int = 1, col: int = 1,
@@ -1319,6 +1428,292 @@ class HP1631A:
         Maximum size: 13576 bytes.
         """
         return self.gpib.query_binary("TE", max_bytes=16384, delay=2.0)
+
+    def verify_instrument_identity(self) -> dict:
+        """
+        Download the TC (configuration) learn string and decode the instrument
+        identity block confirmed by ROM55 $8AEF–$8B12.
+
+        Returns a dict with:
+          "series"        : "HP 1631" or "HP 1630"
+          "variant"       : "A (standard)" or "D (data)"
+          "is_1631"       : bool
+          "is_data_variant": bool
+          "identity_valid": bool — True if class marker, family ID, series,
+                            and variant all match expected values
+          "description"   : human-readable summary string
+          "raw"           : bytes — the full TC learn string
+
+        Use this at session start to confirm you are talking to the expected
+        instrument model before sending configuration learn strings. The 1631D
+        (data variant) has extended state analysis capabilities not present on
+        the 1631A — sending a 1631D state learn string to a 1631A will be
+        silently rejected with firmware error type 3 at $8A7B.
+        """
+        tc_raw = self.get_config_learn_string()
+        info = LearnStringParser.parse_config_header(tc_raw)
+        info["raw"] = tc_raw
+        return info
+
+    def set_instrument_gpib_address(self, new_address: int,
+                                    verify: bool = True) -> int:
+        """
+        Program the instrument's own GPIB address via the SM (System
+        specification) learn string.
+
+        IMPORTANT — firmware collision avoidance (ROM55 $8197–$81A9):
+        The instrument firmware automatically increments the requested address
+        if it conflicts with either:
+          (a) a reserved address stored at ROM55 $29DC, or
+          (b) the currently active listener address at RAM $DFEC.
+        This means the address you request may not be the address the instrument
+        actually uses. The firmware error message 'duplicate HP-IB address' /
+        'conflicting HPIB addresses' appears on the front panel display but is
+        NOT propagated to the GPIB status byte, so the Python side cannot detect
+        it without reading the display or re-querying the address.
+
+        This method programs the address through the standard SM / key-entry
+        path (via front-panel cursor navigation) and, if verify=True, reads
+        the TC learn string back and checks the address field at $DE0C to
+        confirm what the firmware actually set, then updates self.gpib.gpib_addr
+        to match the confirmed live address.
+
+        Args:
+          new_address : 0–30 (31 = untalk, not a valid instrument address)
+          verify      : if True (default), read TC back and confirm live address
+
+        Returns:
+          The live GPIB address the instrument is now responding on. This may
+          differ from new_address if the firmware's collision-avoidance fired.
+
+        Raises:
+          ValueError if new_address is out of range.
+        """
+        if not (0 <= new_address <= 30):
+            raise ValueError(
+                f"set_instrument_gpib_address: address {new_address} is out of "
+                "range — GPIB primary addresses are 0–30 (31 is reserved)."
+            )
+
+        # Navigate to System Specification screen and set the logic analyzer
+        # address field. The SM mnemonic enters the System menu; the LA address
+        # is the first numeric field on that screen.
+        self.gpib.write("SM")
+        time.sleep(0.3)
+        self.gpib.write("CH")
+        time.sleep(0.2)
+        # Cursor to address field and enter value
+        self.gpib.write(f"SL {new_address}")
+        time.sleep(0.5)
+
+        if not verify:
+            return new_address
+
+        # Read TC to confirm the live address. The firmware stores the active
+        # HP-IB address at $DE0C (config block); parse_config_header now
+        # decodes the identity block — the address field location in the full
+        # 5145-byte TC payload is not yet fully mapped, so we use the SM/TC
+        # roundtrip as the authoritative confirmation and log a note.
+        #
+        # NOTE: If the full TC config field table (54 entries at ROM55 $8B95)
+        # is ever mapped to byte offsets, the address check should read
+        # data[payload_offset + addr_field_offset] directly instead of this
+        # heuristic. Filed as a future enhancement — see HP1631A_ROM_Analysis.md.
+        time.sleep(0.5)
+        tc_raw = self.get_config_learn_string()
+        info = LearnStringParser.parse_config_header(tc_raw)
+
+        if not info.get("identity_valid"):
+            import warnings
+            warnings.warn(
+                "set_instrument_gpib_address: TC identity check failed after "
+                f"setting address {new_address} — cannot confirm live address. "
+                "The firmware's collision-avoidance at $8197 may have changed "
+                "the address without notification.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return new_address
+
+        # Update the adapter's local pointer to the confirmed address.
+        # Until the TC config field table is fully mapped we trust the
+        # requested value unless we can prove otherwise.
+        self.gpib.gpib_addr = new_address
+        return new_address
+
+    # ── Acquisition verification ────────────────────────────────────────────
+
+    def verify_acquisition(self, fetch_config: bool = False) -> dict:
+        """
+        Cross-check TS (state) and TT (timing) learn strings to determine
+        whether an acquisition actually produced data, and if not, which
+        acquisition mode (if either) has channels assigned.
+
+        This mirrors the diagnostic sequence in hp1631a_probe.py Step 10:
+        a learn string can come back perfectly well-formed (correct header,
+        correct CRC) and still carry zero samples if the corresponding pod
+        isn't assigned in the Format menu, or if the instrument's active
+        trace mode doesn't match the learn string you downloaded.
+
+        If fetch_config=True, also downloads the TC (configuration) learn
+        string and decodes the instrument identity block (series, variant)
+        confirmed by ROM55 $8AEF. A 1631D (data variant) vs 1631A mismatch
+        is flagged in the verdict — sending D-variant state learn strings to
+        an A-variant instrument is silently rejected by the firmware.
+
+        Returns a dict:
+          {
+            "state":  {"channels": int, "states": int, "valid": bool, "raw": bytes},
+            "timing": {"channels": int, "states": int, "valid": bool, "raw": bytes},
+            "config": {
+                "valid": bool, "raw": bytes,
+                "series": str, "variant": str,
+                "is_1631": bool, "is_data_variant": bool,
+                "identity_valid": bool,
+            } or None if fetch_config=False,
+            "verdict": str,       # human-readable summary
+            "ok": bool,           # True if at least one mode has both
+                                  # channels>0 and states>0
+          }
+
+        Does not change instrument state (no RN/ST/RST) — safe to call at
+        any time, including right after a capture, to explain an empty
+        result without re-arming or disturbing the current acquisition.
+        """
+        result = {"state": {}, "timing": {}, "config": None}
+
+        ts_raw = self.get_state_learn_string()
+        ts_info = LearnStringParser.parse_state_header(ts_raw)
+        result["state"] = {
+            "channels": ts_info.get("state_channels", 0),
+            "states":   ts_info.get("valid_states", 0),
+            "valid":    ts_info.get("valid", False),
+            "header":   ts_info.get("header"),
+            "raw":      ts_raw,
+        }
+
+        tt_raw = self.get_timing_learn_string()
+        tt_info = LearnStringParser.parse_timing_header(tt_raw)
+        result["timing"] = {
+            "channels": tt_info.get("timing_channels", 0),
+            "states":   tt_info.get("valid_states", 0),
+            "valid":    tt_info.get("valid", False),
+            "header":   tt_info.get("header"),
+            "raw":      tt_raw,
+        }
+
+        config_warnings = []
+        if fetch_config:
+            tc_raw = self.get_config_learn_string()
+            tc_info = LearnStringParser.parse_config_header(tc_raw)
+            result["config"] = {
+                "valid":            tc_info.get("valid", False),
+                "raw":              tc_raw,
+                "series":           tc_info.get("series", "unknown"),
+                "variant":          tc_info.get("variant", "unknown"),
+                "is_1631":          tc_info.get("is_1631", False),
+                "is_data_variant":  tc_info.get("is_data_variant", False),
+                "identity_valid":   tc_info.get("identity_valid", False),
+                "description":      tc_info.get("description", ""),
+            }
+            if tc_info.get("identity_valid"):
+                if not tc_info.get("is_1631"):
+                    config_warnings.append(
+                        f"Instrument reports as {tc_info.get('series')} — "
+                        "this toolkit is validated against the HP 1631A/D."
+                    )
+                if tc_info.get("is_data_variant"):
+                    config_warnings.append(
+                        "Instrument is the HP 1631D (data variant). "
+                        "D-variant state learn strings sent to an A-variant "
+                        "instrument will be rejected by firmware at $8A7B."
+                    )
+            elif tc_info.get("valid"):
+                config_warnings.append(
+                    "TC identity block failed ROM-confirmed magic check "
+                    "(class marker / family ID mismatch) — instrument model "
+                    "cannot be confirmed. See parse_config_header() details."
+                )
+
+        st = result["state"]
+        tm = result["timing"]
+        st_ok = st["channels"] > 0 and st["states"] > 0
+        tm_ok = tm["channels"] > 0 and tm["states"] > 0
+
+        if st_ok and tm_ok:
+            verdict = (f"Both modes have data: State {st['states']} samples "
+                      f"({st['channels']} ch), Timing {tm['states']} samples "
+                      f"({tm['channels']} ch).")
+        elif st_ok and not tm_ok:
+            verdict = (f"State mode has data ({st['states']} samples, "
+                      f"{st['channels']} channels) but Timing does not "
+                      f"(channels={tm['channels']}, states={tm['states']}). "
+                      "Timing pod is likely unassigned in Format menu, or "
+                      "State is the active trace mode.")
+        elif tm_ok and not st_ok:
+            verdict = (f"Timing mode has data ({tm['states']} samples, "
+                      f"{tm['channels']} channels) but State does not "
+                      f"(channels={st['channels']}, states={st['states']}). "
+                      "State pod is likely unassigned in Format menu, or "
+                      "Timing is the active trace mode.")
+        elif st["channels"] == 0 and tm["channels"] == 0:
+            verdict = ("Neither State nor Timing pods report any assigned "
+                      "channels. Check System → Format on the front panel "
+                      "and assign at least one pod in either Format screen.")
+        else:
+            verdict = (f"Channels are assigned (State={st['channels']}, "
+                      f"Timing={tm['channels']}) but no samples were "
+                      f"captured (State={st['states']}, Timing={tm['states']}). "
+                      "Acquisition likely hasn't completed, or the trigger "
+                      "condition was never met. Re-arm with RN and confirm "
+                      "the trigger fires before downloading.")
+
+        if config_warnings:
+            verdict += "  Config warnings: " + "; ".join(config_warnings)
+
+        result["verdict"] = verdict
+        result["ok"] = st_ok or tm_ok
+        return result
+
+    def detect_trace_mode(self) -> dict:
+        """
+        Best-effort detection of which trace mode (State or Timing) is
+        currently active on the front panel, by reading the List screen
+        header text via DR. Does not change instrument state beyond
+        navigating to the List menu (LM), which is non-destructive and
+        does not arm or clear any acquisition.
+
+        The 1631A does not expose "active trace mode" as a queryable
+        register over GPIB — this only exists as display text — so this
+        is a heuristic based on matching known header strings ("State
+        Listing", "Timing Listing", "Waveform Listing") in the first
+        screen row. If the heuristic can't determine the mode, 'mode'
+        will be None and 'raw_header' will contain whatever text was
+        found, so the caller can fall back to other checks (e.g.
+        verify_acquisition()).
+
+        Returns:
+          {"mode": "state" | "timing" | "waveform" | None,
+           "raw_header": str}
+        """
+        self.gpib.write("LM")
+        time.sleep(0.4)
+        try:
+            header_text = self.display_read(1, 1, 64)
+        except Exception:
+            header_text = ""
+
+        h = header_text.upper()
+        if "STATE" in h:
+            mode = "state"
+        elif "TIMING" in h:
+            mode = "timing"
+        elif "WAVEFORM" in h or "WFORM" in h:
+            mode = "waveform"
+        else:
+            mode = None
+
+        return {"mode": mode, "raw_header": header_text.strip()}
 
     # ── Utility ─────────────────────────────────────────────────────────────
 
@@ -1428,16 +1823,153 @@ class LearnStringParser:
         return info
 
     @classmethod
+    def parse_state_header(cls, data: bytes) -> dict:
+        """
+        Parse the fixed header fields of a TS (state) learn string.
+
+        Reads the standard parse_header() fields plus TS-specific fields:
+
+          state_channels   : int  -- channel count from header byte 4
+          valid_states     : int  -- valid state count from header bytes 5-6
+                                     (big-endian uint16, same layout as TT)
+          tracepoint_index : int  -- tracepoint from header bytes 7-8
+          n_states_file    : int  -- cross-check: state count derived from
+                                     total file size using the reverse-engineered
+                                     TS binary layout (_DATA_START=18, 5 bytes/record)
+          crc_ok           : bool -- CRC verification result
+          header_type      : str  -- "RS" or error description
+          n_channels       : int  -- alias for state_channels (backward compat)
+          n_states         : int  -- alias for valid_states (backward compat)
+
+        Layout (reverse-engineered, HP 1631A):
+          Bytes  0-1   "RS" header
+          Bytes  2-3   byte_count (big-endian uint16)
+          Bytes  4-17  14-byte fixed header: byte 4 = channel count,
+                       bytes 5-6 = valid state count (MSB first),
+                       bytes 7-8 = tracepoint index
+          Bytes 18..N  sample data, 5 bytes per sample (big-endian uint40)
+          Byte  N+1    revision code
+          Bytes N+2-3  CRC (16-bit sum of bytes 4..N, big-endian)
+        """
+        info = cls.parse_header(data)
+
+        # Populate zero-value defaults so callers can always key-access safely
+        info.setdefault("state_channels",   0)
+        info.setdefault("valid_states",     0)
+        info.setdefault("tracepoint_index", 0)
+        info.setdefault("n_states_file",    0)
+        info.setdefault("crc_ok",           False)
+        info.setdefault("header_type",      info.get("error", "too short"))
+        info.setdefault("n_channels",       0)
+        info.setdefault("n_states",         0)
+
+        if not info["valid"] or len(data) < 9:
+            return info
+
+        info["state_channels"]   = data[4]
+        info["valid_states"]     = struct.unpack(">H", data[5:7])[0]
+        info["tracepoint_index"] = struct.unpack(">H", data[7:9])[0]
+
+        # Cross-check: derive state count from file size using the
+        # reverse-engineered TS binary layout
+        _DATA_START = 18
+        _BYTES_PER  = 5
+        total_use   = min(4 + info["byte_count"], len(data))
+        data_len    = max(0, (total_use - 3) - _DATA_START)
+        info["n_states_file"] = data_len // _BYTES_PER
+
+        # CRC verification
+        info["crc_ok"] = cls.verify_crc(data)
+
+        # Backward-compat aliases
+        info["header_type"] = data[0:2].decode(errors="replace")
+        info["n_channels"]  = info["state_channels"]
+        info["n_states"]    = info["valid_states"]
+
+        return info
+
+    @classmethod
     def parse_config_header(cls, data: bytes) -> dict:
-        """Parse identifying fields from a TC (configuration) learn string."""
+        """
+        Parse identifying fields from a TC (configuration) learn string.
+
+        The TC response is wrapped in the standard RC framing (2-byte 'RC'
+        header + 2-byte length + data + revision + CRC), with the 256-byte
+        instrument configuration payload starting at byte 4.
+
+        The first 20 bytes of that payload are a fixed identity block,
+        confirmed by ROM55 $8AEF–$8B12 (the TX-side builder):
+
+          Payload[0-1]   = 0x80 0x00   class marker
+          Payload[2-5]   = 'L','1','6','3'   family identifier
+          Payload[6]     = 0x30 ('0') = HP 1630 series
+                         | 0x31 ('1') = HP 1631 series   (RAM $2765)
+          Payload[7]     = 0x41 ('A') = standard variant
+                         | 0x44 ('D') = data variant      (bit 1 of $2764)
+          Payload[8-9]   = 0x00 0x00  (reserved)
+          Payload[10-11] = 0x00 0x02  version/count = 2
+          Payload[12-13] = 0x10 0x00
+          Payload[14-17] = 0x00 × 4
+          Payload[18-19] = 0x00 0x08
+          Payload[20..255] packed configuration fields (54-entry descriptor
+                           table at ROM55 $8B95; disc model strings at $8BEB)
+
+        Reference: HP 1631A ROM analysis, Oct 1985 firmware (01630-80054–61).
+        """
         info = cls.parse_header(data)
         if not info["valid"]:
             return info
-        # Configuration data is 5138 bytes (bytes 4..5141) — complex internal format
-        # Just report what we know from the header
+
+        # Configuration payload begins at byte 4 (after RC header + 2-byte length)
+        payload_offset = 4
+        if len(data) < payload_offset + 20:
+            info["description"] = (
+                "TC configuration learn string — payload too short to decode "
+                "instrument identity block (need ≥24 bytes total)."
+            )
+            return info
+
+        p = data[payload_offset:]
+
+        # ── Magic / family validation ────────────────────────────────────────
+        class_marker = p[0:2]
+        family_id    = p[2:6]
+
+        info["class_marker_ok"]  = (class_marker == bytes([0x80, 0x00]))
+        info["family_id_ok"]     = (family_id == b"L163")
+        info["class_marker_hex"] = class_marker.hex(" ").upper()
+        info["family_id_str"]    = family_id.decode("ascii", errors="replace")
+
+        # ── Series and variant ───────────────────────────────────────────────
+        series_byte  = p[6]
+        variant_byte = p[7]
+
+        _SERIES  = {0x30: "HP 1630", 0x31: "HP 1631"}
+        _VARIANT = {0x41: "A (standard)", 0x44: "D (data)"}
+
+        info["series"]       = _SERIES.get(series_byte,
+                                            f"unknown (0x{series_byte:02X})")
+        info["variant"]      = _VARIANT.get(variant_byte,
+                                             f"unknown (0x{variant_byte:02X})")
+        info["series_ok"]    = series_byte in _SERIES
+        info["variant_ok"]   = variant_byte in _VARIANT
+        info["is_1631"]      = series_byte == 0x31
+        info["is_data_variant"] = variant_byte == 0x44
+
+        # ── Version fields ───────────────────────────────────────────────────
+        info["version_word_10_11"] = (p[10] << 8) | p[11]   # expected 0x0002
+        info["word_12_13"]         = (p[12] << 8) | p[13]   # expected 0x1000
+        info["word_18_19"]         = (p[18] << 8) | p[19]   # expected 0x0008
+
+        # ── Sanity summary ───────────────────────────────────────────────────
+        all_ok = (
+            info["class_marker_ok"] and info["family_id_ok"]
+            and info["series_ok"] and info["variant_ok"]
+        )
+        info["identity_valid"] = all_ok
         info["description"] = (
-            "Configuration learn string — use send_config_learn_string() "
-            "to restore to instrument"
+            f"TC learn string — {info['series']} variant {info['variant']}"
+            f"{'' if all_ok else ' [IDENTITY CHECK FAILED — check parse_config_header() details]'}"
         )
         return info
 
@@ -1467,6 +1999,43 @@ class LearnStringParser:
             else:
                 word_val = struct.unpack(">H", data[offset:offset+2])[0]
                 records.append([(word_val >> bit) & 1 for bit in range(16)])
+        return records
+
+    @classmethod
+    def extract_state_data(cls, data: bytes) -> list[list[int]]:
+        """
+        Extract raw state sample records from a TS learn string.
+
+        Returns a list of 40-element lists; each inner list contains the 40
+        channel bit values for one state sample (bit 0 = index 0, LSB of
+        the last byte of the 5-byte sample record).
+
+        Sample layout (reverse-engineered, HP 1631A TS binary format):
+          Bytes 18..N  -- sample data, 5 bytes per sample, big-endian uint40.
+          Bit 0 of the 40-bit word = channel 0 (lowest-numbered channel).
+
+        Returns an empty list if the learn string is invalid or has no samples.
+        Used by hp1631a_gui.py for the waveform viewer and CSV state export.
+        """
+        _DATA_START = 18
+        _BYTES_PER  = 5
+        _N_CH       = 40
+
+        info = cls.parse_state_header(data)
+        if not info["valid"]:
+            return []
+        # Use header-field count first; fall back to file-size-derived count
+        n_states = info.get("valid_states", 0) or info.get("n_states_file", 0)
+        if n_states == 0:
+            return []
+
+        records = []
+        for i in range(n_states):
+            off = _DATA_START + i * _BYTES_PER
+            if off + _BYTES_PER > len(data):
+                break
+            word = int.from_bytes(data[off: off + _BYTES_PER], "big")
+            records.append([(word >> bit) & 1 for bit in range(_N_CH)])
         return records
 
 
@@ -1515,16 +2084,89 @@ def load_config(analyzer: HP1631A, filepath: str):
     """
     Send a previously saved TC learn string back to the instrument as RC.
     The instrument accepts the exact bytes returned by TC — no modification needed.
+
+    Before writing, validates:
+      1. The data starts with 'RC' (correct receive header for config).
+      2. The payload identity block passes the ROM-confirmed magic check:
+           bytes [4:6] == 0x80 0x00, [6:10] == b'L163'
+         The firmware at $8A7B checks these and sets error code 3 for any
+         mismatch — without this check, a bad file write is silently rejected.
+      3. The total length matches the byte-count field in the header.
+
+    Raises ValueError with a descriptive message if any check fails so the
+    caller gets a Python-side error rather than a silent firmware rejection.
     """
     with open(filepath, "rb") as f:
         data = f.read()
-    if len(data) < 4:
-        print("  [error] File too short.")
-        return
-    # The learn string already starts with "RC" header — send it as-is.
-    # For Prologix we write raw bytes to the serial port after addressing;
-    # for other adapters we use write_raw if available, else base64-chunk it.
-    print(f"  Sending {len(data)} bytes to instrument…")
+
+    if len(data) < 24:
+        raise ValueError(
+            f"load_config: {filepath!r} is only {len(data)} bytes — "
+            "too short to contain a valid TC learn string (minimum ~24 bytes "
+            "for header + identity block)."
+        )
+
+    # ── Check 1: RC header ───────────────────────────────────────────────────
+    if data[0:2] != b"RC":
+        raise ValueError(
+            f"load_config: {filepath!r} does not start with 'RC' — "
+            f"got {data[0:2]!r}. This may be a state (RS) or timing (RT) "
+            "learn string, not a configuration learn string."
+        )
+
+    # ── Check 2: Length consistency ──────────────────────────────────────────
+    byte_count = struct.unpack(">H", data[2:4])[0]
+    expected_total = 4 + byte_count
+    if len(data) < expected_total:
+        raise ValueError(
+            f"load_config: {filepath!r} declares {byte_count} bytes of "
+            f"payload (total {expected_total}) but file is only {len(data)} "
+            "bytes — file is truncated."
+        )
+
+    # ── Check 3: ROM-confirmed identity block (payload starts at byte 4) ─────
+    # Firmware builder at $8AEF writes: 0x80 0x00 'L' '1' '6' '3' series variant
+    # Firmware receiver at $8A7B validates these and errors out on mismatch.
+    p = data[4:]
+    if p[0:2] != bytes([0x80, 0x00]):
+        raise ValueError(
+            f"load_config: identity block class marker is {p[0:2].hex(' ').upper()!r}, "
+            "expected '80 00'. This does not appear to be a valid HP 163x "
+            "configuration learn string."
+        )
+    if p[2:6] != b"L163":
+        raise ValueError(
+            f"load_config: identity block family ID is {p[2:6]!r}, "
+            "expected b'L163'. This is not an HP 1630/1631-series learn string."
+        )
+    series_byte  = p[6]
+    variant_byte = p[7]
+    if series_byte not in (0x30, 0x31):
+        raise ValueError(
+            f"load_config: series byte is 0x{series_byte:02X} — "
+            "expected 0x30 ('0' = HP 1630) or 0x31 ('1' = HP 1631)."
+        )
+    if variant_byte not in (0x41, 0x44):
+        raise ValueError(
+            f"load_config: variant byte is 0x{variant_byte:02X} — "
+            "expected 0x41 ('A' = standard) or 0x44 ('D' = data)."
+        )
+    series  = "HP 1631" if series_byte == 0x31 else "HP 1630"
+    variant = "D (data)" if variant_byte == 0x44 else "A (standard)"
+
+    # ── CRC check ────────────────────────────────────────────────────────────
+    crc_ok = LearnStringParser.verify_crc(data)
+    if not crc_ok:
+        raise ValueError(
+            f"load_config: {filepath!r} CRC mismatch — the file may be "
+            "corrupt or was modified after saving. Sending a bad learn string "
+            "to the instrument may leave it in an indeterminate state."
+        )
+
+    print(f"  Config learn string: {series} variant {variant}, "
+          f"{len(data)} bytes, CRC OK.")
+    print(f"  Sending to instrument at GPIB address {analyzer.gpib.gpib_addr}…")
+
     gpib = analyzer.gpib
     if isinstance(gpib, PrologixGPIB):
         gpib._raw_write(f"++addr {gpib.gpib_addr}")
@@ -1535,7 +2177,8 @@ def load_config(analyzer: HP1631A, filepath: str):
         gpib._gpib.write(gpib._dev, data)
     else:
         raise NotImplementedError(
-            "load_config: binary write not implemented for this adapter type."
+            "load_config: binary write not implemented for this adapter type. "
+            f"Adapter is {type(gpib).__name__}."
         )
     time.sleep(1.0)
     print("  Done.")

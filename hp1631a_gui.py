@@ -25,13 +25,14 @@ Requires
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, messagebox
+from tkinter import ttk, scrolledtext, filedialog, messagebox, simpledialog
 import threading
 import queue
 import time
 import os
 import sys
 import json
+import datetime
 
 # ── pyserial ────────────────────────────────────────────────────────────────
 try:
@@ -53,6 +54,7 @@ try:
         GPIBAdapter, PrologixGPIB, NI488GPIB, USBTmcGPIB, USBGpibV2GPIB, PyVisaGPIB,
         open_gpib_adapter,
         HP1631A,
+        LearnStringParser,
         save_config, load_config,
         capture_and_export,
         render_ascii_waveform,
@@ -79,10 +81,28 @@ except ImportError:
 
 # ── hp1631a_lrn_to_sr ───────────────────────────────────────────────────────
 try:
-    from hp1631a_lrn_to_sr import convert as convert_lrn_to_sr
+    from hp1631a_lrn_to_sr import (
+        convert as convert_lrn_to_sr,
+        convert_state as convert_state_lrn_to_sr,
+        CHANNEL_PRESETS,
+        TTLearnString,
+        StateLearnString,
+    )
     HAS_LRN_SR = True
 except ImportError:
     HAS_LRN_SR = False
+    CHANNEL_PRESETS = {}
+
+# ── hp1631a_diff ────────────────────────────────────────────────────────────
+try:
+    from hp1631a_diff import (
+        load_capture,
+        diff_captures,
+        DiffResult,
+    )
+    HAS_DIFF = True
+except ImportError:
+    HAS_DIFF = False
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Palette  —  green-phosphor CRT
@@ -167,6 +187,7 @@ def load_settings() -> dict:
         "port": "", "addr": "5", "timeout": "5.0",
         "adapter": "Prologix",
         "cap_path": "capture.txt", "sr_rate": "10000000",
+        "sr_preset": "(none)",
         "csv_stem": "trace", "batch_n": "10",
         "batch_delay": "1.0", "batch_dir": "captures",
         "use_srq": False, "also_sr": True,
@@ -186,6 +207,65 @@ def save_settings(d: dict):
             json.dump(d, f, indent=2)
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Target profiles  (#7 — named per-target capture configurations)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A "profile" bundles everything needed to re-point this tool at a
+# previously-probed target without re-entering settings by hand: GPIB
+# address, sample rate, the channel-label preset (or a custom channel
+# name list) for .sr export, and an optional trigger pattern. Useful when
+# rotating probe connections between several systems on the bench (e.g.
+# a PDP-11/23, an AT&T 3B2, and a broadcast graphics board), each of
+# which has a different, fixed acquisition setup worth not re-deriving
+# every session.
+#
+# Stored as a flat dict of name -> profile in PROFILES_FILE, separate
+# from hp1631a_gui.json (connection/UI state) so profiles aren't
+# overwritten by the normal per-session settings autosave.
+
+PROFILES_FILE = os.path.join(_SCRIPT_DIR, "hp1631a_profiles.json")
+
+PROFILE_DEFAULTS = {
+    "description":   "",
+    "adapter":       "Prologix",
+    "gpib_addr":     "5",
+    "sr_rate":       "10000000",
+    "sr_preset":     "(none)",
+    "channel_names": "",   # comma-separated; used if sr_preset == "(none)"
+    "trigger_pattern": "",
+    "trigger_label_row": "1",
+    "notes":         "",
+}
+
+
+def load_profiles() -> dict:
+    try:
+        with open(PROFILES_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_profiles(profiles: dict):
+    try:
+        with open(PROFILES_FILE, "w") as f:
+            json.dump(profiles, f, indent=2)
+    except Exception:
+        pass
+
+
+def make_profile(**overrides) -> dict:
+    """Return a new profile dict with PROFILE_DEFAULTS filled in, then
+    overridden by any keyword arguments provided."""
+    p = dict(PROFILE_DEFAULTS)
+    p.update(overrides)
+    return p
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -489,10 +569,79 @@ class Worker(threading.Thread):
         self._log(f"{mnemonic}; → (keyboard mnemonic)", "cmd")
 
     # ── capture ─────────────────────────────────────────────────────────────
-    def do_capture(self, path, use_srq, also_sr, sr_rate):
+    def do_capture(self, path, use_srq, also_sr, sr_rate, preset=None,
+                   glitch_arm=False, glitch_config=None):
         if not self._ready(): return
         self._status("Capturing…")
         self._log("── Capture ───────────────────────────────────", "section")
+
+        # Best-effort trace mode detection (#3): the GUI always downloads
+        # both TT and TS, so this is informational rather than blocking —
+        # but it lets us warn *before* arming if the front panel is
+        # clearly showing a mode that won't produce timing data, etc.
+        try:
+            mode_info = self.analyzer.detect_trace_mode()
+            mode = mode_info["mode"]
+            if mode == "state":
+                self._log(
+                    "Trace mode appears to be STATE (List screen header: "
+                    f"{mode_info['raw_header']!r}). Timing (TT) download "
+                    "may come back empty unless Timing mode is also armed.",
+                    "info")
+            elif mode == "timing":
+                self._log(
+                    "Trace mode appears to be TIMING (List screen header: "
+                    f"{mode_info['raw_header']!r}). State (TS) download "
+                    "may come back empty unless State mode is also armed.",
+                    "info")
+            elif mode == "waveform":
+                self._log(
+                    "List screen is showing WAVEFORM (analog) data, not "
+                    "State or Timing digital listings.", "info")
+        except Exception:
+            pass  # detection is best-effort; never block capture on it
+
+        # ── Glitch detect arming ──────────────────────────────────────────────
+        # Strategy: send a previously saved glitch-enabled TC config as RC
+        # before arming RN.  The user saves a "glitch ON" TC via the
+        # SAVE NOW button (which calls do_save_glitch_config below).  This
+        # approach is reliable because we are sending the exact bytes the
+        # instrument itself produced when glitch mode was enabled — no
+        # manual byte-offset patching required.
+        if glitch_arm:
+            cfg_path = glitch_config or os.path.join(
+                getattr(self, "_learn_output_dir", "."), "glitch_config.lrn")
+            if os.path.exists(cfg_path):
+                self._log(f"Glitch arm: sending config from {cfg_path}…", "info")
+                try:
+                    with open(cfg_path, "rb") as f:
+                        gc_data = f.read()
+                    if len(gc_data) >= 4 and gc_data[0:2] == b"RC":
+                        from hp1631a_extended import (
+                            PrologixGPIB, USBTmcGPIB, PyVisaGPIB, NI488GPIB)
+                        gpib = self.gpib
+                        if isinstance(gpib, PrologixGPIB):
+                            gpib._raw_write(f"++addr {gpib.gpib_addr}")
+                            gpib.ser.write(gc_data)
+                        elif isinstance(gpib, (USBTmcGPIB, PyVisaGPIB)):
+                            gpib._inst.write_raw(gc_data)
+                        elif isinstance(gpib, NI488GPIB):
+                            gpib._gpib.write(gpib._dev, gc_data)
+                        else:
+                            self._log("  Glitch config: adapter type does not support "
+                                      "binary RC write — skipping.", "error")
+                        time.sleep(0.8)
+                        self._log("  Glitch config sent (RC).", "good")
+                    else:
+                        self._log(f"  Glitch config invalid (expected RC header) — "
+                                  "skipping.", "error")
+                except Exception as e:
+                    self._log(f"  Glitch arm failed: {e}", "error")
+            else:
+                self._log(
+                    f"Glitch arm: config file not found ({cfg_path}).  "
+                    "Use SAVE NOW in the Capture tab after enabling glitch "
+                    "capture on the instrument.", "error")
 
         # Re-assert SRQ mask and log current status before starting
         self.gpib.write("MB 34")
@@ -538,6 +687,7 @@ class Worker(threading.Thread):
 
         self._log("TT; → (Timing data)…", "info")
         tt = self.gpib.query_binary("TT", max_bytes=65536, delay=1.5)
+        tt_info = {}
         if len(tt) >= 4:
             p = stem + "_timing.lrn"
             with open(p, "wb") as f: f.write(tt)
@@ -545,25 +695,109 @@ class Worker(threading.Thread):
             header = tt[0:2].decode(errors="replace")
             count  = (tt[2] << 8) | tt[3]
             self._log(f"  Timing: {len(tt)} B  header={header!r}  → {p}", "good")
-            from hp1631a_extended import LearnStringParser
-            info = LearnStringParser.parse_timing_header(tt)
-            self._log(f"  CH={info.get('timing_channels')}  "
-                      f"States={info.get('valid_states')}  "
-                      f"Runs={info.get('runs')}", "info")
+            tt_info = LearnStringParser.parse_timing_header(tt)
+            tt_ch = tt_info.get("timing_channels", 0)
+            tt_st = tt_info.get("valid_states", 0)
+            glitch_actual = tt_info.get("glitch_mode", False)
+            self._log(
+                f"  CH={tt_ch}  States={tt_st}  "
+                f"Runs={tt_info.get('runs')}  "
+                f"Glitch={'ON' if glitch_actual else 'off'}", "info")
+            # Verify glitch state against arming intent
+            if glitch_arm and not glitch_actual:
+                self._log(
+                    "  ⚠ Glitch arm was ON but glitch capture is OFF in "
+                    "the downloaded TT.  The saved config may pre-date "
+                    "enabling glitch mode on the instrument.  Use "
+                    "SAVE NOW to refresh the glitch config.", "error")
+            elif glitch_arm and glitch_actual:
+                self._log("  Glitch capture confirmed active.", "good")
+            if tt_ch == 0 or tt_st == 0:
+                self._log(
+                    f"  ⚠ Timing learn string is empty (CH={tt_ch}, States={tt_st}). "
+                    "Either the timing pod isn't assigned in Format, or "
+                    "State (not Timing) is the active trace mode. "
+                    "Use VERIFY ACQUISITION for a full cross-check.", "error")
             samples = LearnStringParser.extract_timing_data(tt)
-            if samples and info.get("timing_channels"):
-                n_ch = info["timing_channels"]
+            if samples and tt_ch:
                 chs = [(f"CH{c}", [(s[c] if c < len(s) else 0) for s in samples])
-                       for c in range(n_ch)]
+                       for c in range(tt_ch)]
                 self.log_q.put(("learn_channels", chs))
+                # Pass sample rate to waveform viewer for cursor delta time display
+                if HAS_LRN_SR:
+                    try:
+                        _tt_obj = TTLearnString(tt)
+                        if _tt_obj.sample_rate_hz > 0:
+                            self.log_q.put(("wave_samplerate", _tt_obj.sample_rate_hz))
+                    except Exception:
+                        pass
 
         self._log("TS; → (State data)…", "info")
         ts = self.gpib.query_binary("TS", max_bytes=65536, delay=1.5)
+        ts_info = {}
         if len(ts) >= 4:
             p = stem + "_state.lrn"
             with open(p, "wb") as f: f.write(ts)
             files_saved.append(p)
-            self._log(f"  State: {len(ts)} B → {p}", "good")
+            ts_info = LearnStringParser.parse_state_header(ts)
+            ts_ch = ts_info.get("state_channels", 0)
+            ts_st = ts_info.get("valid_states", 0)
+            self._log(f"  State: {len(ts)} B  CH={ts_ch}  States={ts_st}  → {p}", "good")
+            if ts_ch == 0 or ts_st == 0:
+                self._log(
+                    f"  ⚠ State learn string is empty (CH={ts_ch}, States={ts_st}). "
+                    "Either the state pod isn't assigned in Format, or "
+                    "Timing (not State) is the active trace mode.", "error")
+            else:
+                # Push state channel data to the waveform viewer.
+                # extract_state_data() returns 1024×40 bit records; filter to
+                # only channels that have at least one transition (i.e. only
+                # the probed/connected pod channels), and apply preset names.
+                state_records = LearnStringParser.extract_state_data(ts)
+                if state_records and HAS_LRN_SR:
+                    _n_bits = 40
+                    _preset_names = (
+                        list(CHANNEL_PRESETS.get(preset, []))
+                        if preset and preset in CHANNEL_PRESETS else []
+                    )
+                    # Pad with generic names
+                    while len(_preset_names) < _n_bits:
+                        _preset_names.append(f"S{len(_preset_names)}")
+                    state_chs = []
+                    for _ci in range(_n_bits):
+                        _bits = [(rec[_ci] if _ci < len(rec) else 0) for rec in state_records]
+                        _edges = sum(1 for _j in range(1, len(_bits)) if _bits[_j] != _bits[_j-1])
+                        if _edges > 0:   # skip static (unconnected) channels
+                            state_chs.append((_preset_names[_ci], _bits))
+                    if state_chs:
+                        self._log(f"  Waveform: {len(state_chs)} active state channel(s)", "info")
+                        self.log_q.put(("learn_channels", state_chs))
+                    else:
+                        self._log("  (All state bits static — nothing to show in waveform viewer)", "info")
+                elif state_records:
+                    # HAS_LRN_SR is False but extract_state_data exists in extended
+                    state_chs = []
+                    for _ci in range(40):
+                        _bits = [(rec[_ci] if _ci < len(rec) else 0) for rec in state_records]
+                        _edges = sum(1 for _j in range(1, len(_bits)) if _bits[_j] != _bits[_j-1])
+                        if _edges > 0:
+                            state_chs.append((f"S{_ci}", _bits))
+                    if state_chs:
+                        self.log_q.put(("learn_channels", state_chs))
+
+        # Cross-mode summary: tell the user which mode (if either) actually
+        # captured data, so an empty TT alongside a populated TS (or vice
+        # versa) is immediately explained rather than silently logged.
+        tt_ok = tt_info.get("timing_channels", 0) > 0 and tt_info.get("valid_states", 0) > 0
+        ts_ok = ts_info.get("state_channels", 0)  > 0 and ts_info.get("valid_states", 0)  > 0
+        if tt_ok and not ts_ok and ts_info:
+            self._log("  → Timing data is good; State mode is not configured/active.", "info")
+        elif ts_ok and not tt_ok and tt_info:
+            self._log("  → State data is good; Timing mode is not configured/active.", "info")
+        elif not tt_ok and not ts_ok:
+            self._log(
+                "  ⚠ Neither Timing nor State produced data. Run VERIFY ACQUISITION "
+                "in the CONTROL tab for a full diagnostic.", "error")
 
         self._log("Navigating to LM (List) and reading screen (DR)…", "info")
         self.gpib.write("LM")
@@ -577,21 +811,97 @@ class Worker(threading.Thread):
         non_empty = sum(1 for r in rows if r.strip())
         self._log(f"  Screen: {non_empty} non-empty rows → {p}", "good")
 
+        # ── Capture config sidecar (#6) ────────────────────────────────────
+        # Save a small JSON file alongside the .lrn/.txt outputs recording
+        # everything needed to understand this capture later: which mode
+        # was detected/active, channel/state counts for both TT and TS,
+        # the GPIB connection used, the preset and sample rate applied for
+        # .sr export, and the list of files this capture produced. This is
+        # the "wait, what was I even capturing" answer for future-you.
+        sidecar_path = stem + "_capture.json"
+        try:
+            tc_summary = None
+            if len(tc) >= 4:
+                tc_info = LearnStringParser.parse_config_header(tc)
+                tc_summary = {
+                    "valid": tc_info.get("valid", False),
+                    "bytes": len(tc),
+                }
+
+            sidecar = {
+                "schema_version": 1,
+                "captured_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "capture_stem": stem,
+                "detected_trace_mode": locals().get("mode"),
+                "connection": {
+                    "adapter": type(self.gpib).__name__ if self.gpib else None,
+                    "gpib_address": getattr(self.gpib, "gpib_addr", None),
+                },
+                "config": tc_summary,
+                "timing": {
+                    "channels": tt_info.get("timing_channels", 0),
+                    "states":   tt_info.get("valid_states", 0),
+                    "runs":     tt_info.get("runs"),
+                    "ok":       tt_ok,
+                } if tt_info else None,
+                "state": {
+                    "channels": ts_info.get("state_channels", 0),
+                    "states":   ts_info.get("valid_states", 0),
+                    "ok":       ts_ok,
+                } if ts_info else None,
+                "sr_export": {
+                    "requested": bool(also_sr),
+                    "preset": preset,
+                    "samplerate_hz": sr_rate,
+                } if also_sr else None,
+                "screen_nonempty_rows": non_empty,
+                "files": [os.path.basename(f) for f in files_saved],
+            }
+            with open(sidecar_path, "w", encoding="utf-8") as f:
+                json.dump(sidecar, f, indent=2)
+            files_saved.append(sidecar_path)
+            self._log(f"  Config record: → {sidecar_path}", "info")
+        except Exception as e:
+            self._log(f"  (Could not write capture config sidecar: {e})", "info")
+
         self._log(f"Capture complete. {len(files_saved)} file(s) saved.", "good")
 
         if also_sr:
             sr_path = stem + ".sr"
             self._status("Converting to .sr…")
             self._log("Converting to sigrok .sr…", "info")
-            lrn_path = stem + "_timing.lrn"
+
+            # Presets are tagged by which capture mode they target. The
+            # LSI-11/Q-bus presets are built for synchronous STATE capture
+            # (clocked on BCLK via J/K/L); the HC11 preset is built for
+            # async TIMING capture (free-running clock resolving AS/E
+            # edges). Route to the matching .lrn file and converter
+            # automatically so the user doesn't have to know this.
+            state_presets = {"lsi11-16", "lsi11-ctrl"}
+            use_state = preset in state_presets
+
+            if use_state:
+                lrn_path = stem + "_state.lrn"
+                mode_label = "state"
+            else:
+                lrn_path = stem + "_timing.lrn"
+                mode_label = "timing"
+
             ok2 = False
             if HAS_LRN_SR and os.path.exists(lrn_path):
-                # Preferred: binary learn string → .sr (no sample rate needed,
-                # decoded automatically from TT header)
-                ok2 = convert_lrn_to_sr(
-                    lrn_path=lrn_path,
-                    output_path=sr_path,
-                )
+                if use_state:
+                    ok2 = convert_state_lrn_to_sr(
+                        lrn_path=lrn_path,
+                        output_path=sr_path,
+                        samplerate_override=(sr_rate if sr_rate > 0 else 1_000_000),
+                        preset=preset,
+                    )
+                else:
+                    ok2 = convert_lrn_to_sr(
+                        lrn_path=lrn_path,
+                        output_path=sr_path,
+                        preset=preset,
+                    )
             elif HAS_SR:
                 # Fallback: ASCII screen text → .sr (requires user-supplied rate)
                 screen_path = stem + "_screen.txt"
@@ -607,15 +917,28 @@ class Worker(threading.Thread):
                     "Place it in the same directory as this script.",
                     "error")
             if ok2:
-                self._log(f"Sigrok: {sr_path}", "good")
+                self._log(f"Sigrok: {sr_path}  ({mode_label} mode"
+                          f"{', preset=' + preset if preset else ''})", "good")
+                if preset == "hc11-19":
+                    self._log(
+                        "  Note: the HC11 decoder requires all 19 channels "
+                        "(AD0-7, A8-15, AS, E, R/W) to run — if fewer were "
+                        "captured, decode will fail in PulseView even though "
+                        "this .sr file was written successfully.", "info")
             elif HAS_LRN_SR or HAS_SR:
                 # Try to give a more specific reason than "failed"
                 if os.path.exists(lrn_path) and os.path.getsize(lrn_path) < 60:
                     self._log(
-                        "SR conversion failed: timing learn string is too short "
-                        f"({os.path.getsize(lrn_path)} bytes) — "
+                        f"SR conversion failed: {mode_label} learn string is "
+                        f"too short ({os.path.getsize(lrn_path)} bytes) — "
                         "States=0 means no data was captured. "
                         "Check that the trigger fired and the acquisition completed.",
+                        "error")
+                elif not os.path.exists(lrn_path):
+                    self._log(
+                        f"SR conversion failed: {lrn_path} not found. "
+                        f"{'State' if use_state else 'Timing'} learn string "
+                        "may not have downloaded — check the log above.",
                         "error")
                 else:
                     self._log("SR conversion failed — check log output above.", "error")
@@ -625,6 +948,61 @@ class Worker(threading.Thread):
         self._status("Ready")
 
     # ── config save / load ─────────────────────────────────────────────────
+    def do_save_glitch_config(self, path):
+        """Download TC learn string and save as a glitch-capture config file."""
+        if not self._ready(): return
+        self._status("Saving glitch config…")
+        self._log("Saving glitch config: downloading TC learn string…", "info")
+        tc = self.gpib.query_binary("TC", max_bytes=6000, delay=0.8)
+        if len(tc) < 4:
+            self._log("TC returned no data — not connected?", "error")
+            self._status("Ready")
+            return
+        if tc[0:2] not in (b"RC", b"TC"):
+            try:
+                hdr = tc[0:2].decode("ascii", errors="replace")
+            except Exception:
+                hdr = repr(tc[0:2])
+            self._log(f"Unexpected TC header {hdr!r} (expected 'RC').", "error")
+            self._status("Ready")
+            return
+        with open(path, "wb") as f:
+            f.write(tc)
+        # Parse and report the glitch mode from the embedded TT timing header
+        glitch_on = self._check_tc_glitch_mode(tc)
+        glitch_str = ("ON" if glitch_on else "OFF") if glitch_on is not None else "unknown"
+        self._log(
+            f"Glitch config saved: {path}  ({len(tc)} bytes)  "
+            f"Glitch mode in config: {glitch_str}", "good")
+        if glitch_on is False:
+            self._log(
+                "  ⚠ The saved config has glitch capture OFF.  "
+                "Enable glitch mode on the instrument (Format menu) first, "
+                "then click SAVE NOW again.", "error")
+        self._status("Ready")
+
+    @staticmethod
+    def _check_tc_glitch_mode(tc_data: bytes):
+        """
+        Attempt to determine whether glitch capture is enabled in a TC blob
+        by searching for any byte pattern that could be the TT-format glitch
+        flag embedded within the TC configuration data.
+
+        The HP 1631A TC learn string embeds the complete instrument state.
+        The timing format glitch flag (byte 9 from the start of any TT
+        sub-block) appears at a fixed but firmware-version-dependent offset
+        within TC.  We use a best-effort scan: look for the TT header magic
+        bytes "RT" followed by a plausible byte-count and read byte 9 from
+        that position.  Returns True/False/None (None = pattern not found).
+        """
+        if not tc_data or len(tc_data) < 14:
+            return None
+        # Search for "RT" within the TC payload (after the 4-byte header)
+        for i in range(4, len(tc_data) - 10):
+            if tc_data[i:i+2] == b"RT" and i + 9 < len(tc_data):
+                return bool(tc_data[i + 9])
+        return None
+
     def do_save_config(self, path):
         if not self._ready(): return
         self._status("Downloading CONFIG?…")
@@ -703,15 +1081,43 @@ class Worker(threading.Thread):
         else:
             self._log(f"TT: only {len(tt)} bytes — may need valid clock/probes", "error")
 
-        # ── State binary save ─────────────────────────────────────────────
+        # ── State CSV ─────────────────────────────────────────────────────
         self._log("TS; → State learn string…", "info")
         ts = self.gpib.query_binary("TS", max_bytes=65536, delay=1.5)
-        if len(ts) >= 4:
+        if len(ts) >= 21:
             lrn_path = stem + "_state.lrn"
             with open(lrn_path, "wb") as f: f.write(ts)
-            self._log(f"  {len(ts)} B → {lrn_path} (binary)", "good")
+            ts_info = LearnStringParser.parse_state_header(ts)
+            ts_st = ts_info.get("valid_states", 0)
+            self._log(f"  {len(ts)} B  States={ts_st}  → {lrn_path}", "good")
+            state_records = LearnStringParser.extract_state_data(ts)
+            if state_records:
+                # Find active (non-static) bit positions
+                active_chs = []
+                for _ci in range(40):
+                    _bits = [(rec[_ci] if _ci < len(rec) else 0) for rec in state_records]
+                    _edges = sum(1 for _j in range(1, len(_bits)) if _bits[_j] != _bits[_j-1])
+                    if _edges > 0:
+                        active_chs.append((_ci, _bits))
+                if active_chs:
+                    csv_path = stem + "_state.csv"
+                    headers = [f"S{ci}" for ci, _ in active_chs]
+                    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                        w = _csv.writer(f)
+                        w.writerow(["state"] + headers)
+                        for idx in range(len(state_records)):
+                            w.writerow([idx] + [_bits[idx] for _, _bits in active_chs])
+                    self._log(f"  {len(state_records)} states, "
+                              f"{len(active_chs)} active channels → {csv_path}", "good")
+                    # Push to waveform viewer
+                    state_chs = [(f"S{ci}", _bits) for ci, _bits in active_chs]
+                    self.log_q.put(("learn_channels", state_chs))
+                else:
+                    self._log("  (All 40 state bits static — no CSV written)", "info")
+            else:
+                self._log(f"  State learn string empty ({ts_st} states) — no CSV", "info")
         else:
-            self._log(f"TS: only {len(ts)} bytes", "error")
+            self._log(f"TS: only {len(ts)} bytes — skipping state decode", "error")
 
         # ── Screen text ───────────────────────────────────────────────────
         self._log("LM + DR → screen text…", "info")
@@ -728,45 +1134,113 @@ class Worker(threading.Thread):
         self._status("Ready")
 
     # ── batch ──────────────────────────────────────────────────────────────
-    def do_batch(self, count, out_dir, delay, use_srq):
+    def do_batch(self, count, out_dir, delay, use_srq, profile=None):
+        """
+        Capture `count` traces in a loop, saving binary learn strings
+        (config/timing/state + screen text) for each, the same way
+        do_capture() does for a single trace.
+
+        profile : optional dict from PROFILE_DEFAULTS (see load_profiles())
+                  — if given, its sr_preset/sr_rate/channel_names are
+                  applied to each trace's .sr export, and gpib_addr is
+                  logged for the record even though changing it on a
+                  live connection isn't done automatically (the user is
+                  expected to have already connected at the right address;
+                  see _apply_profile_to_connection_fields in the App class).
+        """
         if not self._ready(): return
         os.makedirs(out_dir, exist_ok=True)
         self._log(f"── Batch: {count} traces → {out_dir} ──────────────", "section")
+
+        preset = None
+        sr_rate = 10_000_000
+        channel_names = None
+        if profile:
+            self._log(f"Using profile: {profile.get('description') or '(unnamed)'}",
+                      "info")
+            raw_preset = profile.get("sr_preset", "(none)")
+            preset = None if raw_preset in (None, "(none)", "") else raw_preset
+            try:
+                sr_rate = int(profile.get("sr_rate", 10_000_000))
+            except (TypeError, ValueError):
+                sr_rate = 10_000_000
+            cn = profile.get("channel_names", "")
+            if cn and not preset:
+                channel_names = [n.strip() for n in cn.split(",") if n.strip()]
+
         for n in range(1, count + 1):
             self._status(f"Batch trace {n}/{count}…")
             self._log(f"Trace {n}/{count}", "info")
-            self.analyzer.start()
+
+            self.gpib.write("MB 34")
+            time.sleep(0.15)
+            self.gpib.write("RN")
+            self._cancel.clear()
             ok = (self.analyzer.wait_for_srq(120) if use_srq
-                  else self.analyzer.wait_for_data(120))
+                  else self._wait_cancellable(120))
             if not ok:
-                self._log(f"Trace {n}: timeout, skipping.", "error")
+                msg = "Cancelled — stopping batch." if self._cancel.is_set() \
+                      else f"Trace {n}: timeout, skipping."
+                self._log(msg, "error")
+                if self._cancel.is_set():
+                    break
                 continue
-            slist = self.analyzer.get_state_listing()
-            tlist = self.analyzer.get_timing_listing()
-            wlist = self.analyzer.get_waveform_listing()
-            fn = os.path.join(out_dir, f"trace_{n:03d}.txt")
-            with open(fn, "w", encoding="utf-8") as f:
-                f.write(f"# Trace {n}/{count}  {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                f.write("--- STATE LISTING ---\n" + slist + "\n\n")
-                f.write("--- TIMING LISTING ---\n" + tlist + "\n\n")
-                f.write("--- WAVEFORM LISTING ---\n" + wlist + "\n")
-            self._log(f"  Saved: {fn}", "good")
+
+            stem = os.path.join(out_dir, f"trace_{n:03d}")
+
+            tt = self.gpib.query_binary("TT", max_bytes=65536, delay=1.5)
+            ts = self.gpib.query_binary("TS", max_bytes=65536, delay=1.5)
+
+            saved = []
+            if len(tt) >= 4:
+                p = stem + "_timing.lrn"
+                with open(p, "wb") as f: f.write(tt)
+                saved.append(p)
+            if len(ts) >= 4:
+                p = stem + "_state.lrn"
+                with open(p, "wb") as f: f.write(ts)
+                saved.append(p)
+
+            tt_info = LearnStringParser.parse_timing_header(tt) if len(tt) >= 4 else {}
+            ts_info = LearnStringParser.parse_state_header(ts) if len(ts) >= 4 else {}
+            tt_ok = tt_info.get("timing_channels", 0) > 0 and tt_info.get("valid_states", 0) > 0
+            ts_ok = ts_info.get("state_channels", 0) > 0 and ts_info.get("valid_states", 0) > 0
+
+            if not saved:
+                self._log(f"  Trace {n}: no learn string data received.", "error")
+            else:
+                self._log(f"  Trace {n}: {len(saved)} file(s) "
+                          f"(TT {'ok' if tt_ok else 'empty'}, "
+                          f"TS {'ok' if ts_ok else 'empty'}) → {stem}*", "good")
+
+            # Optional per-trace .sr export using the profile's preset/rate
+            if HAS_LRN_SR and (preset or channel_names):
+                use_state = preset in {"lsi11-16", "lsi11-ctrl"}
+                lrn_path = (stem + "_state.lrn") if use_state else (stem + "_timing.lrn")
+                if os.path.exists(lrn_path):
+                    sr_path = stem + ".sr"
+                    try:
+                        if use_state:
+                            convert_state_lrn_to_sr(
+                                lrn_path=lrn_path, output_path=sr_path,
+                                samplerate_override=sr_rate,
+                                channel_names=channel_names, preset=preset)
+                        else:
+                            convert_lrn_to_sr(
+                                lrn_path=lrn_path, output_path=sr_path,
+                                channel_names=channel_names, preset=preset)
+                        self._log(f"  Trace {n}: .sr → {sr_path}", "good")
+                    except Exception as e:
+                        self._log(f"  Trace {n}: .sr export failed: {e}", "error")
+
             self.log_q.put(("progress_pct", int(100 * n / count)))
             if n < count:
                 time.sleep(delay)
+
         self._log("── Batch complete ────────────────────────────", "section")
         self._status("Ready")
 
     # ── waveform download ──────────────────────────────────────────────────
-    def do_get_waveform(self):
-        if not self._ready(): return
-        self._status("Downloading WLIST?…")
-        self._log("WLIST? →", "cmd")
-        wraw = self.analyzer.get_waveform_listing()
-        self.log_q.put(("listing_data", wraw))
-        self._log(f"Waveform: {len(wraw)} bytes received.", "good")
-        self._status("Ready")
-
     def do_get_timing(self):
         """Legacy stub — download timing via TT learn string instead."""
         if not self._ready(): return
@@ -814,8 +1288,28 @@ class Worker(threading.Thread):
             self._log("  → Neither flag set — instrument may still be acquiring "
                       "or MB mask was cleared.", "error")
 
-        # Step 3: raw TT download and hex dump of first 64 bytes
-        self._log("Step 3 — Sending TT and reading raw bytes…", "info")
+        # Step 3: TC/TS/TT cross-check — determines which acquisition mode
+        # (if either) actually has channels assigned and samples captured.
+        # This is the same check hp1631a_probe.py performs standalone,
+        # now available directly from the GUI without leaving the app.
+        self._log("Step 3 — Cross-checking State and Timing learn strings…", "info")
+        result = self.analyzer.verify_acquisition()
+
+        st = result["state"]
+        tm = result["timing"]
+        self._log(
+            f"  State  (TS): header={st['header']!r}  "
+            f"channels={st['channels']}  states={st['states']}",
+            "good" if (st["channels"] > 0 and st["states"] > 0) else "error")
+        self._log(
+            f"  Timing (TT): header={tm['header']!r}  "
+            f"channels={tm['channels']}  states={tm['states']}",
+            "good" if (tm["channels"] > 0 and tm["states"] > 0) else "error")
+        self._log(f"  Verdict: {result['verdict']}",
+                  "good" if result["ok"] else "error")
+
+        # Step 4: raw TT download and hex dump of first 64 bytes
+        self._log("Step 4 — Sending TT and reading raw bytes…", "info")
         self.gpib.write("TT")
         time.sleep(2.0)
         raw = self.gpib.read_binary(max_bytes=65536)
@@ -871,6 +1365,44 @@ class Worker(threading.Thread):
                 self._log("  Transfer length matches header byte count ✓", "good")
 
         self._log("── Verify complete ───────────────────────────", "section")
+        self._status("Ready")
+
+
+    def do_set_trigger(self, pattern: str, label_row: int = 1,
+                       dont_care_key: str = "DC"):
+        """
+        Send a channel-by-channel trigger pattern to the instrument's
+        Trace/Trigger spec screen via HP1631A.set_trigger_pattern().
+
+        See the ⚠ UNVERIFIED MNEMONIC WARNING in
+        HP1631A.set_trigger_pattern() — the don't-care key mnemonic is a
+        best guess. This method logs the result and reminds the user to
+        visually confirm the pattern landed correctly on the front panel
+        or via the Trace screen display read.
+        """
+        if not self._ready(): return
+        self._status("Setting trigger pattern…")
+        self._log("── Set Trigger Pattern ───────────────────────", "section")
+        self._log(f"Pattern: {pattern}  (label row {label_row}, "
+                  f"don't-care key={dont_care_key!r})", "cmd")
+
+        ok = self.analyzer.set_trigger_pattern(
+            pattern, label_row=label_row, dont_care_key=dont_care_key)
+
+        if not ok:
+            self._log(
+                f"  Invalid pattern characters in {pattern!r} — only "
+                "0, 1, X (or N) are allowed.", "error")
+            self._status("Ready")
+            return
+
+        self._log("  Pattern keystrokes sent.", "good")
+        self._log(
+            "  ⚠ This mnemonic sequence has not been independently "
+            "verified against the manual's trigger-entry section. "
+            "Check the front panel (or use READ SCREEN on the Trace "
+            "menu) to confirm the pattern landed correctly before "
+            "relying on it for a capture.", "info")
         self._status("Ready")
 
     def do_learn_string(self, cmd: str):
@@ -970,20 +1502,48 @@ class WaveformCanvas(tk.Frame):
     Each channel occupies a fixed-height row.  Transitions are drawn as
     vertical steps.  Channel labels are shown on the left.  A horizontal
     scrollbar allows panning over long captures.
+
+    Cursor A (amber)  : left-click to place.
+    Cursor B (cyan)   : right-click to place.  When both are set the info
+                        bar shows Δ samples and (if sample rate is known) Δt.
+    Middle-click      : clear both cursors.
+
+    Bus groups        : shown as hex-value rows below the channel rows.
+                        Defined via BusGroupDialog (opened from the toolbar).
+
+    Pattern search    : type a pattern in the search bar, press Find/Next.
+                        Syntax:  CH1=1,CH2=0,CH3=X   (name=value)
+                                 1X0X11              (positional, X=don't-care)
+                        Matches are marked with green tick marks at the top.
     """
 
-    ROW_H    = 28   # pixels per channel row
-    LABEL_W  = 90   # pixels reserved for the channel name column
-    SIG_H    = 18   # signal trace height within the row
-    PAD_TOP  = 8    # top padding above first row
+    ROW_H     = 28   # pixels per channel row
+    BUS_ROW_H = 22   # pixels per bus-group row
+    LABEL_W   = 90   # pixels reserved for the channel name column
+    SIG_H     = 18   # signal trace height within the row
+    PAD_TOP   = 8    # top padding above first row
     MIN_PX_PER_SAMPLE = 1
 
     def __init__(self, parent, **kw):
         super().__init__(parent, bg=BG, **kw)
-        self._channels = []   # list of (name, [0/1 samples])
-        self._zoom = 4        # pixels per sample
+        self._channels    = []     # list of (name, [0/1 samples])
+        self._zoom        = 4      # pixels per sample
+        self._samplerate  = 0      # Hz; 0 = unknown (disables time display)
+        self._divergences = None   # optional dict: channel_name -> set(sample_indices)
+        self._diff_offset = 0      # baseline sample index
 
-        # Scrollbars
+        # Cursor state
+        self._cursor_x  = None    # cursor A (amber), left-click
+        self._cursor_x2 = None    # cursor B (cyan),  right-click
+
+        # Bus groups  [{"name": str, "indices": [int], "color": str}]
+        self._bus_groups = []
+
+        # Pattern search
+        self._search_matches = []  # list of sample indices
+        self._search_cur     = -1  # index into _search_matches
+
+        # ── Scrollbars ────────────────────────────────────────────────────────
         self._hbar = tk.Scrollbar(self, orient="horizontal")
         self._hbar.pack(side="bottom", fill="x")
         self._vbar = tk.Scrollbar(self, orient="vertical")
@@ -1000,7 +1560,33 @@ class WaveformCanvas(tk.Frame):
         self._hbar.config(command=self._canvas.xview)
         self._vbar.config(command=self._canvas.yview)
 
-        # Zoom controls
+        # ── Search bar ────────────────────────────────────────────────────────
+        search_row = tk.Frame(self, bg=BG)
+        search_row.pack(side="bottom", fill="x")
+        tk.Label(search_row, text="SEARCH", font=FSM, fg=TEXT_DIM, bg=BG
+                 ).pack(side="left", padx=(4, 2))
+        self._search_var = tk.StringVar()
+        tk.Entry(search_row, textvariable=self._search_var, font=FSM,
+                 bg=BG3, fg=GREEN, insertbackground=GREEN, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1, width=22
+                 ).pack(side="left", padx=(0, 2))
+        self._btn_find = tk.Button(
+            search_row, text="▶ FIND", font=FSM, fg=TEXT, bg=BG3,
+            relief="flat", bd=0, activebackground=BG2, activeforeground=GREEN,
+            command=self._do_search, padx=4)
+        self._btn_find.pack(side="left", padx=(0, 2))
+        self._btn_next = tk.Button(
+            search_row, text="→ NEXT", font=FSM, fg=TEXT, bg=BG3,
+            relief="flat", bd=0, activebackground=BG2, activeforeground=GREEN,
+            command=self._do_next_match, padx=4)
+        self._btn_next.pack(side="left", padx=(0, 2))
+        self._search_lbl = tk.Label(search_row, text="", font=FSM,
+                                    fg=TEXT_DIM, bg=BG)
+        self._search_lbl.pack(side="left", padx=4)
+        # Bind Enter key in search entry
+        self._search_var.trace_add("write", lambda *_: None)
+
+        # ── Zoom controls & info label ─────────────────────────────────────────
         ctrl = tk.Frame(self, bg=BG)
         ctrl.pack(side="bottom", fill="x")
         tk.Label(ctrl, text="ZOOM", font=FSM, fg=TEXT_DIM, bg=BG
@@ -1012,18 +1598,50 @@ class WaveformCanvas(tk.Frame):
                  highlightthickness=0, bd=0, sliderlength=12,
                  font=FSM
                  ).pack(side="left")
-        tk.Label(ctrl, text="px/sample", font=FSM, fg=TEXT_DIM, bg=BG
-                 ).pack(side="left", padx=(0,10))
+        tk.Label(ctrl, text="px/smp", font=FSM, fg=TEXT_DIM, bg=BG
+                 ).pack(side="left", padx=(0, 6))
+        # Clear cursors button
+        tk.Button(ctrl, text="CLR CUR", font=FSM, fg=TEXT_DIM, bg=BG3,
+                  relief="flat", bd=0, activebackground=BG2,
+                  command=self._clear_cursors, padx=3
+                  ).pack(side="left", padx=(0, 6))
         self._info_lbl = tk.Label(ctrl, text="", font=FSM, fg=TEXT_DIM, bg=BG)
         self._info_lbl.pack(side="left")
 
+        # ── Canvas bindings ───────────────────────────────────────────────────
         self._canvas.bind("<ButtonPress-1>",   self._on_click)
+        self._canvas.bind("<ButtonPress-3>",   self._on_right_click)
+        self._canvas.bind("<ButtonPress-2>",   self._on_middle_click)
         self._canvas.bind("<MouseWheel>",       self._on_wheel)
         self._canvas.bind("<Button-4>",         self._on_wheel)
         self._canvas.bind("<Button-5>",         self._on_wheel)
-        self._cursor_x = None
+        # Enter key in search box
+        for child in search_row.winfo_children():
+            if isinstance(child, tk.Entry):
+                child.bind("<Return>", lambda e: self._do_search())
 
     # ── public API ─────────────────────────────────────────────────────────
+
+    def set_samplerate(self, hz: int):
+        """Tell the waveform viewer the sample rate so cursor deltas show Δt."""
+        self._samplerate = max(0, int(hz))
+        self._update_info()
+
+    def set_bus_groups(self, groups: list):
+        """
+        Set bus groups.  groups is a list of dicts:
+          {"name": str, "indices": [int], "color": str}
+        where indices are channel indices into self._channels.
+        """
+        self._bus_groups = [g for g in groups
+                            if g.get("indices") and g.get("name")]
+        self._draw()
+
+    def get_channel_count(self) -> int:
+        return len(self._channels)
+
+    def get_channel_names(self) -> list:
+        return [name for name, _ in self._channels]
 
     def load_listing(self, raw_text: str):
         """Parse a listing string and render it."""
@@ -1051,11 +1669,7 @@ class WaveformCanvas(tk.Frame):
         else:
             self._fallback_parse(raw_text)
 
-        n = sum(len(s) for _, s in self._channels)
-        ch = len(self._channels)
-        self._info_lbl.configure(
-            text=f"{ch} channel{'s' if ch!=1 else ''}  │  "
-                 f"{len(self._channels[0][1]) if self._channels else 0} samples")
+        self._update_info()
         self._draw()
 
     def _fallback_parse(self, text: str):
@@ -1077,6 +1691,54 @@ class WaveformCanvas(tk.Frame):
             if samples:
                 self._channels.append((h, samples))
 
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _update_info(self):
+        """Refresh the info label (channel count, samples, cursor delta)."""
+        ch  = len(self._channels)
+        smp = len(self._channels[0][1]) if self._channels else 0
+        base = (f"{ch} ch  │  {smp} smp"
+                if self._channels else "No waveform data")
+
+        if self._cursor_x is not None and self._cursor_x2 is not None:
+            zoom = int(self._zoom_var.get())
+            s1 = max(0, int((self._cursor_x  - self.LABEL_W) // zoom))
+            s2 = max(0, int((self._cursor_x2 - self.LABEL_W) // zoom))
+            delta_smp = abs(s2 - s1)
+            if self._samplerate > 0:
+                dt = delta_smp / self._samplerate
+                if dt < 1e-6:
+                    t_str = f"{dt*1e9:.1f} ns"
+                elif dt < 1e-3:
+                    t_str = f"{dt*1e6:.2f} µs"
+                elif dt < 1.0:
+                    t_str = f"{dt*1e3:.3f} ms"
+                else:
+                    t_str = f"{dt:.4f} s"
+                base += f"  │  Δ={delta_smp} smp  {t_str}"
+            else:
+                base += f"  │  Δ={delta_smp} smp"
+
+        self._info_lbl.configure(text=base)
+
+    def _clear_cursors(self):
+        self._cursor_x  = None
+        self._cursor_x2 = None
+        self._update_info()
+        self._draw()
+
+    def _scroll_to_sample(self, sample_idx: int):
+        """Scroll the canvas so sample_idx is roughly centred."""
+        if not self._channels:
+            return
+        zoom   = int(self._zoom_var.get())
+        n      = len(self._channels[0][1])
+        total_w = self.LABEL_W + n * zoom + 20
+        x      = self.LABEL_W + sample_idx * zoom
+        half_w = max(1, self._canvas.winfo_width() // 2)
+        frac   = max(0.0, min(1.0, (x - half_w) / max(1, total_w)))
+        self._canvas.xview_moveto(frac)
+
     # ── drawing ─────────────────────────────────────────────────────────────
 
     def _draw(self):
@@ -1090,8 +1752,12 @@ class WaveformCanvas(tk.Frame):
 
         zoom      = int(self._zoom_var.get())
         n_samples = len(self._channels[0][1])
+        n_bus     = len(self._bus_groups)
         total_w   = self.LABEL_W + n_samples * zoom + 20
-        total_h   = self.PAD_TOP + len(self._channels) * self.ROW_H + 20
+        total_h   = (self.PAD_TOP
+                     + len(self._channels) * self.ROW_H
+                     + n_bus * self.BUS_ROW_H
+                     + 20)
 
         c.configure(scrollregion=(0, 0, total_w, total_h))
 
@@ -1119,9 +1785,37 @@ class WaveformCanvas(tk.Frame):
             c.create_rectangle(0, y_top, total_w, y_top + self.ROW_H,
                                 fill=bg_col, outline="")
 
-            # Channel label
+            # Divergence highlight (drawn behind the trace, in front of
+            # row background) — a translucent-look red column per
+            # mismatched sample, using thin rectangles since tkinter
+            # canvas has no real alpha blending.
+            if self._divergences and name in self._divergences:
+                div_set = self._divergences[name]
+                if div_set:
+                    # Coalesce consecutive divergent samples into runs so
+                    # we draw far fewer rectangles on long fault regions.
+                    sorted_idx = sorted(div_set)
+                    run_start = sorted_idx[0]
+                    prev = sorted_idx[0]
+                    for idx in sorted_idx[1:] + [None]:
+                        if idx is not None and idx == prev + 1:
+                            prev = idx
+                            continue
+                        x0 = self.LABEL_W + run_start * zoom
+                        x1 = self.LABEL_W + (prev + 1) * zoom
+                        c.create_rectangle(
+                            x0, y_top + 1, x1, y_top + self.ROW_H - 1,
+                            fill="#5a1620", outline="")
+                        if idx is not None:
+                            run_start = prev = idx
+
+            # Channel label (tinted red if this channel has any divergences,
+            # so it's visible even when scrolled away from the highlight)
+            has_div = bool(self._divergences and self._divergences.get(name))
+            label_colour = "#ff6b6b" if has_div else colour
             c.create_text(4, y_top + self.ROW_H // 2,
-                          text=name[:12], fill=colour,
+                          text=name[:12] + (" ⚠" if has_div else ""),
+                          fill=label_colour,
                           font=("Courier New", 8, "bold"), anchor="w")
 
             # Separator line
@@ -1150,20 +1844,148 @@ class WaveformCanvas(tk.Frame):
             if len(pts) >= 4:
                 c.create_line(*pts, fill=colour, width=2)
 
-        # Cursor line (if placed)
+        # ── Bus group rows ────────────────────────────────────────────────────
+        bus_y0 = self.PAD_TOP + len(self._channels) * self.ROW_H
+        for grp_idx, grp in enumerate(self._bus_groups):
+            gy_top = bus_y0 + grp_idx * self.BUS_ROW_H
+            gy_mid = gy_top + self.BUS_ROW_H // 2
+            grp_color = grp.get("color", CYAN)
+
+            # Row background
+            c.create_rectangle(0, gy_top, total_w, gy_top + self.BUS_ROW_H,
+                                fill="#0b1218", outline="")
+            # Label
+            c.create_text(4, gy_mid, text=(grp["name"])[:12],
+                          fill=grp_color, font=("Courier New", 7, "bold"), anchor="w")
+            c.create_line(self.LABEL_W - 2, gy_top,
+                          self.LABEL_W - 2, gy_top + self.BUS_ROW_H, fill=BORDER)
+
+            # Compute combined hex value at each sample position
+            indices = [i for i in grp.get("indices", [])
+                       if 0 <= i < len(self._channels)]
+            if not indices:
+                continue
+
+            n_bits = len(indices)
+            vals = []
+            for s_idx in range(n_samples):
+                word = 0
+                for bit_pos, ch_idx in enumerate(indices):
+                    _, bits = self._channels[ch_idx]
+                    if s_idx < len(bits):
+                        word |= bits[s_idx] << bit_pos
+                vals.append(word)
+
+            # Draw hex value segments (runs of the same value)
+            seg_start = 0
+            seg_val   = vals[0] if vals else 0
+            hex_digits = max(1, (n_bits + 3) // 4)
+            def _draw_bus_seg(x0, x1, val, gy_top, gy_mid, color):
+                w = x1 - x0
+                if w < 2:
+                    return
+                # Draw segment box with two diagonal "corners" at each edge
+                pad = min(4, w // 4)
+                gy_lo = gy_top + 1
+                gy_hi = gy_top + self.BUS_ROW_H - 1
+                # Trapezoid outline
+                pts = [x0 + pad, gy_lo,  x1 - pad, gy_lo,
+                       x1,       gy_mid,  x1 - pad, gy_hi,
+                       x0 + pad, gy_hi,   x0,       gy_mid,
+                       x0 + pad, gy_lo]
+                c.create_polygon(pts, fill="#0f1f2e", outline=color)
+                # Hex text (only if wide enough)
+                if w > 14:
+                    hex_str = f"{val:0{hex_digits}X}"
+                    c.create_text((x0 + x1) // 2, gy_mid, text=hex_str,
+                                  fill=color,
+                                  font=("Courier New", 7, "bold"), anchor="center")
+
+            for s_idx in range(1, n_samples):
+                if vals[s_idx] != seg_val:
+                    x0 = self.LABEL_W + seg_start * zoom
+                    x1 = self.LABEL_W + s_idx * zoom
+                    _draw_bus_seg(x0, x1, seg_val, gy_top, gy_mid, grp_color)
+                    seg_start = s_idx
+                    seg_val   = vals[s_idx]
+            # Last segment
+            x0 = self.LABEL_W + seg_start * zoom
+            x1 = self.LABEL_W + n_samples * zoom
+            _draw_bus_seg(x0, x1, seg_val, gy_top, gy_mid, grp_color)
+
+        # ── Search match tick marks ───────────────────────────────────────────
+        if self._search_matches:
+            for m_idx in self._search_matches:
+                mx = self.LABEL_W + m_idx * zoom + zoom // 2
+                # Draw a small green triangle tick at top of waveform
+                c.create_polygon(mx - 3, 0, mx + 3, 0, mx, 6,
+                                 fill="#39d353", outline="")
+            # Highlight current match
+            if 0 <= self._search_cur < len(self._search_matches):
+                cur_m = self._search_matches[self._search_cur]
+                cmx = self.LABEL_W + cur_m * zoom + zoom // 2
+                c.create_line(cmx, 0, cmx, total_h,
+                              fill="#39d353", dash=(2, 4), tags="search_cur")
+
+        # ── Cursor A (amber, left-click) ──────────────────────────────────────
         if self._cursor_x is not None:
             c.create_line(self._cursor_x, 0, self._cursor_x, total_h,
-                          fill=AMBER, dash=(3,3), tags="cursor")
-            sample_n = max(0, (self._cursor_x - self.LABEL_W) // zoom)
+                          fill=AMBER, dash=(3, 3), tags="cursor_a")
+            sn = max(0, int((self._cursor_x - self.LABEL_W) // zoom))
             c.create_text(self._cursor_x + 3, 2,
-                          text=f"#{sample_n}", fill=AMBER, font=FSM, anchor="nw")
+                          text=f"A:{sn}", fill=AMBER, font=FSM, anchor="nw")
+
+        # ── Cursor B (cyan, right-click) ──────────────────────────────────────
+        if self._cursor_x2 is not None:
+            c.create_line(self._cursor_x2, 0, self._cursor_x2, total_h,
+                          fill=CYAN, dash=(3, 3), tags="cursor_b")
+            sn2 = max(0, int((self._cursor_x2 - self.LABEL_W) // zoom))
+            c.create_text(self._cursor_x2 + 3, 12,
+                          text=f"B:{sn2}", fill=CYAN, font=FSM, anchor="nw")
+
+        # ── Delta label between cursors ───────────────────────────────────────
+        if self._cursor_x is not None and self._cursor_x2 is not None:
+            zoom = int(self._zoom_var.get())
+            s1   = max(0, int((self._cursor_x  - self.LABEL_W) // zoom))
+            s2   = max(0, int((self._cursor_x2 - self.LABEL_W) // zoom))
+            ds   = abs(s2 - s1)
+            mid_x = (self._cursor_x + self._cursor_x2) / 2
+            if self._samplerate > 0:
+                dt = ds / self._samplerate
+                if dt < 1e-6:
+                    t_str = f"{dt*1e9:.0f}ns"
+                elif dt < 1e-3:
+                    t_str = f"{dt*1e6:.2f}µs"
+                elif dt < 1.0:
+                    t_str = f"{dt*1e3:.3f}ms"
+                else:
+                    t_str = f"{dt:.4f}s"
+                delta_lbl = f"Δ{ds}  {t_str}"
+            else:
+                delta_lbl = f"Δ{ds} smp"
+            c.create_text(mid_x, 22, text=delta_lbl,
+                          fill="#ffffff", font=FSM, anchor="center")
+
+    # ── event handlers ────────────────────────────────────────────────────────
 
     def _on_zoom(self, _=None):
+        self._update_info()
         self._draw()
 
     def _on_click(self, event):
-        cx = self._canvas.canvasx(event.x)
-        self._cursor_x = cx
+        self._cursor_x = self._canvas.canvasx(event.x)
+        self._update_info()
+        self._draw()
+
+    def _on_right_click(self, event):
+        self._cursor_x2 = self._canvas.canvasx(event.x)
+        self._update_info()
+        self._draw()
+
+    def _on_middle_click(self, event):
+        self._cursor_x  = None
+        self._cursor_x2 = None
+        self._update_info()
         self._draw()
 
     def _on_wheel(self, event):
@@ -1172,24 +1994,354 @@ class WaveformCanvas(tk.Frame):
         else:
             self._canvas.xview_scroll(3, "units")
 
-    def load_channels(self, channels: list):
+    # ── pattern search ────────────────────────────────────────────────────────
+
+    def _parse_search_pattern(self, pattern: str):
+        """
+        Parse a search pattern string into a list of (samples_list, value) pairs.
+        value is 0 or 1; -1 means don't-care (X).
+
+        Supported formats
+        -----------------
+        Positional bit string: "1X0X11"
+          Each character maps to the corresponding channel (index 0,1,2…).
+          '0'/'1' match; 'X'/'x' = don't-care.
+
+        Named conditions: "CH1=1,CH3=0,CLK=X"
+          Name matches are case-insensitive.  Multiple conditions separated
+          by comma or semicolon.  Unknown channel names are silently ignored.
+        """
+        if not pattern or not self._channels:
+            return []
+
+        pat = pattern.strip()
+        # Detect positional style: only '0', '1', 'X', 'x', ' '
+        if all(c in "01Xx " for c in pat):
+            bits = [c for c in pat.replace(" ", "").upper() if c in "01X"]
+            conds = []
+            for i, bit in enumerate(bits):
+                if i >= len(self._channels):
+                    break
+                val = -1 if bit == "X" else int(bit)
+                conds.append((self._channels[i][1], val))
+            return conds
+
+        # Named style
+        ch_map = {name.lower(): samples
+                  for name, samples in self._channels}
+        conds = []
+        for part in pat.replace(";", ",").split(","):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            name, val_s = part.split("=", 1)
+            name  = name.strip().lower()
+            val_s = val_s.strip().lower()
+            if name not in ch_map:
+                continue
+            val = -1 if val_s == "x" else (int(val_s) if val_s in ("0","1") else None)
+            if val is None:
+                continue
+            conds.append((ch_map[name], val))
+        return conds
+
+    def _do_search(self):
+        """Find all sample positions matching the search pattern."""
+        pattern = self._search_var.get().strip()
+        if not pattern or not self._channels:
+            self._search_matches = []
+            self._search_cur     = -1
+            self._search_lbl.configure(text="")
+            self._draw()
+            return
+
+        conds = self._parse_search_pattern(pattern)
+        if not conds:
+            self._search_lbl.configure(text="bad pattern")
+            return
+
+        n_smp = len(self._channels[0][1])
+        matches = []
+        for si in range(n_smp):
+            if all(
+                (val == -1 or (si < len(samples) and samples[si] == val))
+                for samples, val in conds
+            ):
+                matches.append(si)
+
+        self._search_matches = matches
+        self._search_cur     = 0 if matches else -1
+        count = len(matches)
+        self._search_lbl.configure(
+            text=f"{count} match{'es' if count != 1 else ''}"
+                 if count else "no matches")
+
+        if matches:
+            self._scroll_to_sample(matches[0])
+        self._draw()
+
+    def _do_next_match(self):
+        """Advance to the next search match."""
+        if not self._search_matches:
+            self._do_search()
+            return
+        self._search_cur = (self._search_cur + 1) % len(self._search_matches)
+        self._scroll_to_sample(self._search_matches[self._search_cur])
+        n = len(self._search_matches)
+        self._search_lbl.configure(
+            text=f"{self._search_cur + 1}/{n}")
+        self._draw()
+
+    # ── data loading ──────────────────────────────────────────────────────────
+
+    def load_channels(self, channels: list, divergences: dict = None):
         """
         Load pre-parsed channel data directly (from learn string decoder).
         channels: list of (name, [0/1 sample, ...]) tuples.
+        divergences: optional dict of channel_name -> set/list of sample
+          indices (in this channel data's own index space) to highlight
+          as mismatches, e.g. from a DiffResult. Pass None to clear any
+          previous highlighting.
         """
-        self._channels = channels
-        n = len(channels)
-        s = len(channels[0][1]) if channels else 0
-        self._info_lbl.configure(
-            text=f"{n} channel{'s' if n!=1 else ''}  |  {s} samples")
+        self._channels    = channels
+        self._divergences = (
+            {name: set(idxs) for name, idxs in divergences.items()}
+            if divergences else None
+        )
+        # Clear search matches on new data
+        self._search_matches = []
+        self._search_cur     = -1
+        self._update_info()
         self._draw()
 
     def clear(self):
-        self._channels = []
-        self._cursor_x = None
-        self._info_lbl.configure(text="")
+        self._channels       = []
+        self._divergences    = None
+        self._cursor_x       = None
+        self._cursor_x2      = None
+        self._search_matches = []
+        self._search_cur     = -1
+        self._update_info()
         self._canvas.delete("all")
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Bus group editor dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+class BusGroupDialog(tk.Toplevel):
+    """
+    Dialog for defining named bus groups over currently loaded waveform channels.
+
+    A bus group combines multiple single-bit channels into a labelled row in
+    the waveform viewer that shows the combined hex value at each sample.
+    This is useful for displaying multiplexed buses (address/data lines, etc.)
+    without manually computing the hex value yourself.
+
+    Groups are session-scoped — they are applied to the WaveformCanvas
+    immediately and cleared when the canvas is cleared or a new capture loads
+    (though you can reopen this dialog to redefine them).
+    """
+
+    _GROUP_COLORS = [CYAN, "#bc8cff", "#ffa657", "#79c0ff",
+                     "#7ee787", AMBER, "#ff7b72", "#a5d6ff"]
+
+    def __init__(self, parent, waveform_canvas: WaveformCanvas):
+        super().__init__(parent)
+        self.title("Bus Group Editor")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self._wc     = waveform_canvas
+        self._groups = list(waveform_canvas._bus_groups)  # working copy
+        self._build()
+        self.grab_set()
+        self.minsize(520, 360)
+
+    # ── build ────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        tk.Label(self, text="BUS GROUP EDITOR",
+                 font=FT, fg=AMBER, bg=BG).pack(pady=(10, 2))
+        tk.Label(
+            self,
+            text="Select channels from the right list to form a named bus group.\n"
+                 "Channels are combined LSB-first (first selected = bit 0).\n"
+                 "The hex value is shown per sample in the waveform viewer.",
+            font=FSM, fg=TEXT_DIM, bg=BG, justify="center",
+        ).pack(pady=(0, 8))
+
+        # ── main split: group list (left) | editor (right) ────────────────────
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=10, pady=4)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+
+        # Left: group list
+        lf = tk.Frame(body, bg=BG2, bd=1, relief="solid")
+        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        tk.Label(lf, text="GROUPS", font=FSM, fg=AMBER, bg=BG2
+                 ).pack(anchor="w", padx=6, pady=(4, 0))
+        self._grp_lb = tk.Listbox(
+            lf, font=FMS, bg=BG3, fg=TEXT, selectbackground=BG2,
+            selectforeground=GREEN, activestyle="none",
+            highlightthickness=0, relief="flat")
+        self._grp_lb.pack(fill="both", expand=True, padx=4, pady=4)
+        self._grp_lb.bind("<<ListboxSelect>>", self._on_grp_select)
+
+        grp_btn_row = tk.Frame(lf, bg=BG2)
+        grp_btn_row.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Button(grp_btn_row, text="+ NEW", font=FSM, fg=GREEN, bg=BG3,
+                  relief="flat", bd=0, command=self._new_group, padx=4
+                  ).pack(side="left", padx=(0, 2))
+        tk.Button(grp_btn_row, text="DEL", font=FSM, fg=RED, bg=BG3,
+                  relief="flat", bd=0, command=self._delete_group, padx=4
+                  ).pack(side="left")
+
+        # Right: group editor
+        rf = tk.Frame(body, bg=BG2, bd=1, relief="solid")
+        rf.grid(row=0, column=1, sticky="nsew")
+        tk.Label(rf, text="EDIT GROUP", font=FSM, fg=AMBER, bg=BG2
+                 ).pack(anchor="w", padx=6, pady=(4, 0))
+
+        name_row = tk.Frame(rf, bg=BG2)
+        name_row.pack(fill="x", padx=6, pady=(4, 2))
+        tk.Label(name_row, text="Name:", font=FU, fg=TEXT_DIM, bg=BG2
+                 ).pack(side="left", padx=(0, 4))
+        self._name_var = tk.StringVar()
+        tk.Entry(name_row, textvariable=self._name_var, font=FU,
+                 bg=BG3, fg=TEXT, insertbackground=GREEN, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1, width=18
+                 ).pack(side="left")
+
+        color_row = tk.Frame(rf, bg=BG2)
+        color_row.pack(fill="x", padx=6, pady=(0, 4))
+        tk.Label(color_row, text="Color:", font=FU, fg=TEXT_DIM, bg=BG2
+                 ).pack(side="left", padx=(0, 4))
+        self._color_var = tk.StringVar(value=self._GROUP_COLORS[0])
+        for col in self._GROUP_COLORS:
+            b = tk.Button(color_row, bg=col, width=2, relief="flat",
+                          command=lambda c=col: self._set_color(c))
+            b.pack(side="left", padx=1)
+        self._color_lbl = tk.Label(color_row, text="  ●  ",
+                                   fg=self._GROUP_COLORS[0], bg=BG2,
+                                   font=FU)
+        self._color_lbl.pack(side="left")
+
+        tk.Label(rf, text="Channels (select to include, first = bit 0):",
+                 font=FSM, fg=TEXT_DIM, bg=BG2).pack(anchor="w", padx=6)
+        ch_frame = tk.Frame(rf, bg=BG2)
+        ch_frame.pack(fill="both", expand=True, padx=6, pady=4)
+        ch_sb = tk.Scrollbar(ch_frame, orient="vertical")
+        self._ch_lb = tk.Listbox(
+            ch_frame, font=FMS, bg=BG3, fg=TEXT,
+            selectbackground=BG2, selectforeground=GREEN,
+            activestyle="none", highlightthickness=0, relief="flat",
+            selectmode=tk.MULTIPLE, yscrollcommand=ch_sb.set)
+        ch_sb.config(command=self._ch_lb.yview)
+        ch_sb.pack(side="right", fill="y")
+        self._ch_lb.pack(fill="both", expand=True)
+
+        # Populate channel list
+        ch_names = self._wc.get_channel_names()
+        for i, name in enumerate(ch_names):
+            self._ch_lb.insert("end", f"[{i:02d}] {name}")
+
+        tk.Button(rf, text="SAVE GROUP", font=FU, fg=TEXT, bg=GREEN_DIM,
+                  relief="flat", bd=0, command=self._save_group, padx=6
+                  ).pack(pady=(0, 6))
+
+        # ── bottom buttons ────────────────────────────────────────────────────
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(fill="x", padx=10, pady=(4, 10))
+        tk.Button(btn_row, text="APPLY", font=FU, fg=BG, bg=GREEN,
+                  relief="flat", bd=0, padx=8,
+                  command=self._apply).pack(side="right", padx=(4, 0))
+        tk.Button(btn_row, text="CANCEL", font=FU, fg=TEXT, bg=BG3,
+                  relief="flat", bd=0, padx=8,
+                  command=self.destroy).pack(side="right")
+        tk.Button(btn_row, text="CLEAR ALL", font=FU, fg=RED, bg=BG3,
+                  relief="flat", bd=0, padx=8,
+                  command=self._clear_all).pack(side="left")
+
+        self._refresh_grp_lb()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _refresh_grp_lb(self):
+        self._grp_lb.delete(0, "end")
+        for g in self._groups:
+            color = g.get("color", CYAN)
+            label = f"{'●'} {g['name']}  [{len(g['indices'])} ch]"
+            self._grp_lb.insert("end", label)
+            idx = self._grp_lb.size() - 1
+            self._grp_lb.itemconfig(idx, fg=color)
+
+    def _on_grp_select(self, _=None):
+        sel = self._grp_lb.curselection()
+        if not sel:
+            return
+        g = self._groups[sel[0]]
+        self._name_var.set(g["name"])
+        self._set_color(g.get("color", CYAN))
+        # Select channels in list
+        self._ch_lb.selection_clear(0, "end")
+        for idx in g.get("indices", []):
+            self._ch_lb.selection_set(idx)
+
+    def _new_group(self):
+        self._grp_lb.selection_clear(0, "end")
+        self._ch_lb.selection_clear(0, "end")
+        n = len(self._groups) + 1
+        self._name_var.set(f"BUS{n}")
+        col = self._GROUP_COLORS[(n - 1) % len(self._GROUP_COLORS)]
+        self._set_color(col)
+
+    def _delete_group(self):
+        sel = self._grp_lb.curselection()
+        if not sel:
+            return
+        del self._groups[sel[0]]
+        self._refresh_grp_lb()
+
+    def _save_group(self):
+        name    = self._name_var.get().strip()
+        color   = self._color_var.get()
+        indices = list(self._ch_lb.curselection())
+        if not name:
+            messagebox.showwarning("Bus Group", "Enter a group name.", parent=self)
+            return
+        if not indices:
+            messagebox.showwarning("Bus Group", "Select at least one channel.", parent=self)
+            return
+
+        # Find existing group with same name or update the selected one
+        sel = self._grp_lb.curselection()
+        g = {"name": name, "indices": indices, "color": color}
+        if sel:
+            self._groups[sel[0]] = g
+        else:
+            self._groups.append(g)
+        self._refresh_grp_lb()
+
+    def _set_color(self, color: str):
+        self._color_var.set(color)
+        self._color_lbl.configure(fg=color)
+
+    def _clear_all(self):
+        if messagebox.askyesno("Bus Group Editor", "Clear all groups?", parent=self):
+            self._groups = []
+            self._refresh_grp_lb()
+
+    def _apply(self):
+        self._wc.set_bus_groups(self._groups)
+        self.destroy()
+
+    def _entry(self, parent, var, width=12):
+        return tk.Entry(parent, textvariable=var, font=FU,
+                        bg=BG3, fg=TEXT, insertbackground=GREEN,
+                        relief="flat", highlightbackground=BORDER,
+                        highlightthickness=1, width=width)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1205,6 +2357,7 @@ class DiagnosticsDialog(tk.Toplevel):
       3. Serial poll (is any device at this address?)
       4. EOS sweep — Prologix only; skipped for other adapters
       5. ID command variants — ID?, *IDN?, ID
+      6. Acquisition cross-check — TC/TS/TT channel & state counts
     Each step can be run independently, and results are shown inline.
     """
 
@@ -1214,6 +2367,7 @@ class DiagnosticsDialog(tk.Toplevel):
         ("3  Serial poll",              "step_serial_poll"),
         ("4  EOS sweep (Prologix only)","step_eos_sweep"),
         ("5  ID command variants",      "step_id_variants"),
+        ("6  Acquisition cross-check",  "step_acquisition_check"),
     ]
 
     def __init__(self, parent, worker):
@@ -1441,6 +2595,767 @@ class DiagnosticsDialog(tk.Toplevel):
                 "  \u2022 Verify the HP 1631A HP-IB interface is enabled in SYSTEM \u2192 CONFIG.\n"
                 "  \u2022 Check the GPIB cable \u2014 try a different cable if available.", "error")
 
+    def step_acquisition_check(self):
+        self._append("\u2500\u2500 Step 6: Acquisition cross-check \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", "section")
+        if not self._need_connection(): return
+        self._append(
+            "Downloading TS (state) and TT (timing) learn strings to determine "
+            "which acquisition mode, if either, currently has data. This does "
+            "not arm a new acquisition (no RN/ST sent) \u2014 it only reports on "
+            "whatever is presently in the instrument's buffers.", "info")
+
+        result = self.worker.analyzer.verify_acquisition()
+        st = result["state"]
+        tm = result["timing"]
+
+        self._append(
+            f"  State  (TS): header={st['header']!r}  "
+            f"channels={st['channels']}  states={st['states']}",
+            "good" if (st["channels"] > 0 and st["states"] > 0) else "error")
+        self._append(
+            f"  Timing (TT): header={tm['header']!r}  "
+            f"channels={tm['channels']}  states={tm['states']}",
+            "good" if (tm["channels"] > 0 and tm["states"] > 0) else "error")
+
+        self._append(f"\n  Verdict: {result['verdict']}",
+                     "good" if result["ok"] else "error")
+
+        if not result["ok"]:
+            self._append(
+                "\nNext steps:\n"
+                "  \u2022 On the front panel, press the menu/format key and confirm\n"
+                "    whether State Format or Timing Format is showing pod\n"
+                "    assignments (Off vs TTL/ECL).\n"
+                "  \u2022 Confirm the active Trace mode (State Trace vs Timing Trace)\n"
+                "    matches the mode you intend to capture.\n"
+                "  \u2022 Re-arm with RN, confirm the trigger condition is actually\n"
+                "    met (watch the front panel activity/trigger indicator),\n"
+                "    then re-run this check.", "error")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Trigger pattern builder dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TriggerBuilderDialog(tk.Toplevel):
+    """
+    Channel-by-channel 0/1/X trigger pattern grid.
+
+    Lets the user click through each channel bit (cycling 0 → 1 → X → 0…)
+    instead of hand-typing a pattern string on the front panel, then sends
+    the result via HP1631A.set_trigger_pattern().
+
+    NOTE: the underlying mnemonic for the don't-care key is unverified —
+    see the warning in HP1631A.set_trigger_pattern() and do_set_trigger().
+    This dialog surfaces that same warning before sending.
+    """
+
+    STATES = ["0", "1", "X"]
+    STATE_COLORS = {"0": TEXT_DIM, "1": GREEN, "X": AMBER}
+
+    def __init__(self, parent, worker):
+        super().__init__(parent)
+        self.title("Trigger Pattern Builder")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.worker = worker
+        self._bit_vars = []   # list of tk.StringVar, index 0 = channel 0 / LSB
+        self._n_channels = 16
+        self._build()
+        self.grab_set()
+
+    def _build(self):
+        tk.Label(self, text="TRIGGER PATTERN BUILDER",
+                 font=FT, fg=AMBER, bg=BG).pack(pady=(10, 2))
+        tk.Label(
+            self,
+            text="Click each bit to cycle 0 → 1 → X (don't care).\n"
+                 "Pattern is sent most-significant channel first.",
+            font=FSM, fg=TEXT_DIM, bg=BG, justify="center"
+        ).pack(pady=(0, 8))
+
+        # Channel count selector
+        ch_row = tk.Frame(self, bg=BG)
+        ch_row.pack(pady=(0, 6))
+        tk.Label(ch_row, text="Channels:", font=FU, fg=TEXT, bg=BG
+                 ).pack(side="left", padx=(0, 6))
+        self._nch_var = tk.StringVar(value="16")
+        for n in ("8", "16"):
+            b = tk.Radiobutton(
+                ch_row, text=n, value=n, variable=self._nch_var,
+                font=FU, fg=TEXT, bg=BG, selectcolor=BG3,
+                activebackground=BG, activeforeground=GREEN,
+                command=self._rebuild_grid)
+            b.pack(side="left", padx=4)
+
+        # Label row selector (for multi-label trigger screens)
+        row_row = tk.Frame(self, bg=BG)
+        row_row.pack(pady=(0, 8))
+        tk.Label(row_row, text="Label row:", font=FU, fg=TEXT, bg=BG
+                 ).pack(side="left", padx=(0, 6))
+        self._row_var = tk.StringVar(value="1")
+        self._entry(row_row, self._row_var, 4).pack(side="left")
+
+        # Bit grid
+        self._grid_frame = tk.Frame(self, bg=BG)
+        self._grid_frame.pack(padx=12, pady=(0, 8))
+        self._rebuild_grid()
+
+        # Don't-care key override (advanced / troubleshooting)
+        adv = tk.Frame(self, bg=BG)
+        adv.pack(pady=(0, 8))
+        tk.Label(adv, text="Don't-care key mnemonic:", font=FSM,
+                 fg=TEXT_DIM, bg=BG).pack(side="left", padx=(0, 4))
+        self._dc_var = tk.StringVar(value="DC")
+        self._entry(adv, self._dc_var, 6).pack(side="left")
+        tk.Label(adv, text="(unverified — see warning below)", font=FSM,
+                 fg=RED, bg=BG).pack(side="left", padx=(4, 0))
+
+        # Pattern preview
+        self._preview_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._preview_var, font=FM,
+                 fg=GREEN, bg=BG3, relief="flat", padx=8, pady=4
+                 ).pack(fill="x", padx=12, pady=(0, 8))
+        self._update_preview()
+
+        # Warning
+        tk.Label(
+            self,
+            text="⚠ The don't-care key mnemonic is a best guess, not\n"
+                 "confirmed against the manual. Verify the pattern landed\n"
+                 "correctly on the front panel after sending.",
+            font=FSM, fg=RED, bg=BG, justify="center"
+        ).pack(pady=(0, 8))
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=(0, 10))
+        send_btn = tk.Button(
+            btn_row, text="▶  SEND PATTERN", command=self._send,
+            font=FUB, fg=BG, bg=GREEN, activebackground=GREEN,
+            activeforeground=BG, relief="flat", cursor="hand2",
+            pady=5, padx=16)
+        send_btn.pack(side="left", padx=4)
+        tk.Button(
+            btn_row, text="Close", command=self.destroy,
+            font=FU, fg=BG, bg=TEXT_DIM, relief="flat",
+            cursor="hand2", pady=5, padx=12
+        ).pack(side="left", padx=4)
+
+    def _entry(self, parent, var, width):
+        return tk.Entry(parent, textvariable=var, width=width, font=FM,
+                        bg=BG3, fg=TEXT, insertbackground=GREEN,
+                        relief="flat", highlightbackground=BORDER,
+                        highlightthickness=1)
+
+    def _rebuild_grid(self):
+        for w in self._grid_frame.winfo_children():
+            w.destroy()
+        self._n_channels = int(self._nch_var.get())
+        self._bit_vars = [tk.StringVar(value="X") for _ in range(self._n_channels)]
+
+        # Header row: channel numbers, MSB (highest channel) on the left
+        # to match the on-screen left-to-right field order described in
+        # HP1631A.set_trigger_pattern().
+        for col, ch in enumerate(reversed(range(self._n_channels))):
+            tk.Label(self._grid_frame, text=str(ch), font=FSM,
+                     fg=TEXT_DIM, bg=BG, width=2
+                     ).grid(row=0, column=col, padx=1)
+
+        self._bit_buttons = []
+        for col, ch in enumerate(reversed(range(self._n_channels))):
+            btn = tk.Button(
+                self._grid_frame, text="X", width=2, font=FUB,
+                fg=BG, bg=self.STATE_COLORS["X"],
+                activebackground=AMBER, activeforeground=BG,
+                relief="flat", cursor="hand2",
+                command=lambda c=ch: self._cycle_bit(c))
+            btn.grid(row=1, column=col, padx=1, pady=2)
+            self._bit_buttons.append((ch, btn))
+
+        self._update_preview()
+
+    def _cycle_bit(self, ch_index):
+        var = self._bit_vars[ch_index]
+        cur = var.get()
+        nxt = self.STATES[(self.STATES.index(cur) + 1) % len(self.STATES)]
+        var.set(nxt)
+        # Update the corresponding button's label/color
+        for ch, btn in self._bit_buttons:
+            if ch == ch_index:
+                btn.configure(text=nxt, bg=self.STATE_COLORS[nxt])
+                break
+        self._update_preview()
+
+    def _pattern_string(self) -> str:
+        # MSB (highest channel number) first, matching the grid header order
+        return "".join(
+            self._bit_vars[ch].get()
+            for ch in reversed(range(self._n_channels))
+        )
+
+    def _update_preview(self):
+        p = self._pattern_string()
+        self._preview_var.set(f"Pattern:  {p}")
+
+    def _send(self):
+        pattern = self._pattern_string()
+        try:
+            label_row = int(self._row_var.get())
+        except ValueError:
+            label_row = 1
+        dc_key = self._dc_var.get().strip() or "DC"
+        self.worker.submit(
+            self.worker.do_set_trigger, pattern,
+            label_row=label_row, dont_care_key=dc_key)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Target profile manager dialog  (#7)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ProfileManagerDialog(tk.Toplevel):
+    """
+    Create, edit, delete, and apply named target profiles (see
+    PROFILE_DEFAULTS / load_profiles() / save_profiles()).
+
+    A profile bundles GPIB address, sample rate, .sr channel preset (or
+    custom channel name list), an optional trigger pattern, and free-text
+    notes — everything needed to quickly re-point the tool at a
+    previously-probed target (e.g. "PDP-11/23 BDAL bus", "3B2 WE32100
+    bus") without re-entering settings by hand each session.
+
+    "Apply" copies the profile's connection/export fields into the main
+    window's CONNECTION and CAPTURE tab fields (it does not reconnect
+    automatically — the user still clicks CONNECT, since changing the
+    GPIB address on a live connection isn't something to do silently).
+    """
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.title("Target Profiles")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.app = app
+        self._selected_name = None
+        self._build()
+        self._refresh_list()
+        self.grab_set()
+
+    def _build(self):
+        tk.Label(self, text="TARGET PROFILES", font=FT, fg=AMBER, bg=BG
+                 ).pack(pady=(10, 2))
+        tk.Label(
+            self,
+            text="Save and reload per-target capture setups (GPIB address,\n"
+                 "sample rate, channel preset/names, trigger pattern).",
+            font=FSM, fg=TEXT_DIM, bg=BG, justify="center"
+        ).pack(pady=(0, 8))
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(padx=12, pady=(0, 8), fill="both")
+
+        # ── Left: profile list ──────────────────────────────────────────
+        left = tk.Frame(body, bg=BG)
+        left.pack(side="left", fill="y", padx=(0, 10))
+
+        self._listbox = tk.Listbox(
+            left, width=22, height=12, font=FU, bg=BG3, fg=TEXT,
+            selectbackground=GREEN_DIM, selectforeground=TEXT,
+            relief="flat", highlightbackground=BORDER, highlightthickness=1,
+            exportselection=False)
+        self._listbox.pack(fill="y")
+        self._listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        list_btns = tk.Frame(left, bg=BG)
+        list_btns.pack(fill="x", pady=(4, 0))
+        self._btn(list_btns, "New", self._new_profile, w=8).pack(side="left", padx=1)
+        self._btn(list_btns, "Delete", self._delete_profile, w=8).pack(side="left", padx=1)
+
+        # ── Right: editor fields ────────────────────────────────────────
+        right = tk.Frame(body, bg=BG)
+        right.pack(side="left", fill="both", expand=True)
+
+        self._fields = {}
+        field_defs = [
+            ("description",       "Description"),
+            ("adapter",           "Adapter"),
+            ("gpib_addr",         "GPIB address"),
+            ("sr_rate",           "Sample rate (Hz)"),
+            ("sr_preset",         "Channel preset"),
+            ("channel_names",     "Custom channel names"),
+            ("trigger_pattern",   "Trigger pattern"),
+            ("trigger_label_row", "Trigger label row"),
+        ]
+        for row, (key, label) in enumerate(field_defs):
+            tk.Label(right, text=label, font=FSM, fg=TEXT_DIM, bg=BG
+                     ).grid(row=row, column=0, sticky="w", pady=2)
+            var = tk.StringVar()
+            if key == "sr_preset":
+                widget = ttk.Combobox(
+                    right, textvariable=var,
+                    values=["(none)"] + sorted(CHANNEL_PRESETS),
+                    state="readonly", width=20, font=FU)
+            else:
+                widget = tk.Entry(
+                    right, textvariable=var, width=22, font=FM,
+                    bg=BG3, fg=TEXT, insertbackground=GREEN, relief="flat",
+                    highlightbackground=BORDER, highlightthickness=1)
+            widget.grid(row=row, column=1, sticky="w", padx=(6, 0), pady=2)
+            self._fields[key] = var
+
+        tk.Label(right, text="Notes", font=FSM, fg=TEXT_DIM, bg=BG
+                 ).grid(row=len(field_defs), column=0, sticky="nw", pady=2)
+        self._notes_text = tk.Text(
+            right, width=28, height=4, font=FU, bg=BG3, fg=TEXT,
+            insertbackground=GREEN, relief="flat",
+            highlightbackground=BORDER, highlightthickness=1, wrap="word")
+        self._notes_text.grid(row=len(field_defs), column=1, sticky="w",
+                              padx=(6, 0), pady=2)
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=(4, 10))
+        self._btn(btn_row, "💾  Save", self._save_profile, GREEN, w=10
+                  ).pack(side="left", padx=4)
+        self._btn(btn_row, "▶  Apply to connection", self._apply_profile,
+                  BLUE, w=20).pack(side="left", padx=4)
+        tk.Button(
+            btn_row, text="Close", command=self.destroy,
+            font=FU, fg=BG, bg=TEXT_DIM, relief="flat",
+            cursor="hand2", pady=5, padx=12
+        ).pack(side="left", padx=4)
+
+    def _btn(self, parent, text, cmd, color=TEXT_DIM, w=None):
+        kw = dict(width=w) if w else {}
+        b = tk.Button(parent, text=text, command=cmd, font=FU, fg=BG,
+                      bg=color, activebackground=color, activeforeground=BG,
+                      relief="flat", cursor="hand2", pady=4, **kw)
+        return b
+
+    def _refresh_list(self):
+        self._listbox.delete(0, "end")
+        for name in sorted(self.app._profiles):
+            self._listbox.insert("end", name)
+
+    def _on_select(self, event=None):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        name = self._listbox.get(sel[0])
+        self._selected_name = name
+        p = self.app._profiles.get(name, dict(PROFILE_DEFAULTS))
+        for key, var in self._fields.items():
+            var.set(str(p.get(key, PROFILE_DEFAULTS.get(key, ""))))
+        self._notes_text.delete("1.0", "end")
+        self._notes_text.insert("1.0", p.get("notes", ""))
+        self._name_in_progress = name
+
+    def _new_profile(self):
+        name = simpledialog.askstring(
+            "New Profile", "Profile name (e.g. 'PDP-11/23 BDAL bus'):",
+            parent=self)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.app._profiles:
+            messagebox.showerror("Profile exists",
+                                 f"A profile named {name!r} already exists.")
+            return
+        self.app._profiles[name] = make_profile()
+        save_profiles(self.app._profiles)
+        self._refresh_list()
+        if hasattr(self.app, "_refresh_batch_profiles"):
+            self.app._refresh_batch_profiles()
+        # Select the new entry
+        items = list(self._listbox.get(0, "end"))
+        if name in items:
+            idx = items.index(name)
+            self._listbox.selection_clear(0, "end")
+            self._listbox.selection_set(idx)
+            self._on_select()
+
+    def _delete_profile(self):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        name = self._listbox.get(sel[0])
+        if not messagebox.askyesno("Delete profile",
+                                   f"Delete profile {name!r}? This cannot be undone."):
+            return
+        self.app._profiles.pop(name, None)
+        save_profiles(self.app._profiles)
+        self._refresh_list()
+        if hasattr(self.app, "_refresh_batch_profiles"):
+            self.app._refresh_batch_profiles()
+        self._selected_name = None
+
+    def _save_profile(self):
+        name = getattr(self, "_name_in_progress", None) or self._selected_name
+        if not name:
+            messagebox.showinfo("No profile selected",
+                                "Click 'New' to create a profile first, "
+                                "or select one from the list.")
+            return
+        p = {key: var.get() for key, var in self._fields.items()}
+        p["notes"] = self._notes_text.get("1.0", "end").strip()
+        self.app._profiles[name] = p
+        save_profiles(self.app._profiles)
+        self._refresh_list()
+        if hasattr(self.app, "_refresh_batch_profiles"):
+            self.app._refresh_batch_profiles()
+        # Re-select after refresh (listbox order may shift)
+        items = list(self._listbox.get(0, "end"))
+        if name in items:
+            idx = items.index(name)
+            self._listbox.selection_clear(0, "end")
+            self._listbox.selection_set(idx)
+
+    def _apply_profile(self):
+        name = self._selected_name
+        if not name or name not in self.app._profiles:
+            messagebox.showinfo("No profile selected",
+                                "Select a profile from the list first.")
+            return
+        p = self.app._profiles[name]
+        self.app.apply_profile_to_fields(p)
+        messagebox.showinfo(
+            "Profile applied",
+            f"Profile {name!r} applied to the connection and capture "
+            "fields. Click CONNECT to use the new GPIB address.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Capture diff dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DiffDialog(tk.Toplevel):
+    """
+    Compare two captures (.lrn or .sr) — typically a known-good baseline
+    against a suspect candidate from a faulty board — using
+    hp1631a_diff.py's cross-correlation alignment and per-channel
+    Hamming-distance comparison.
+
+    Workflow: pick baseline + candidate files, optionally override the
+    alignment reference channel and search window, RUN DIFF. Results are
+    shown as a text summary plus a per-channel list; selecting a
+    diverged channel and clicking "Show in waveform viewer" loads both
+    captures' channels into the main window's WaveformCanvas with the
+    mismatched sample ranges highlighted in red.
+    """
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.title("Compare Captures (Diff)")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.minsize(620, 560)
+        self.app = app
+        self._result = None        # most recent DiffResult
+        self._baseline_cap = None  # most recent LoadedCapture
+        self._candidate_cap = None
+        self._build()
+        self.grab_set()
+
+    # ── build ──────────────────────────────────────────────────────────────
+
+    def _build(self):
+        tk.Label(self, text="COMPARE CAPTURES", font=FT, fg=AMBER, bg=BG
+                 ).pack(pady=(10, 2))
+        tk.Label(
+            self,
+            text="Diff a known-good baseline against a candidate capture.\n"
+                 "Trigger-point/pretrigger skew is corrected automatically\n"
+                 "before comparing — see the alignment line in the summary.",
+            font=FSM, fg=TEXT_DIM, bg=BG, justify="center"
+        ).pack(pady=(0, 8))
+
+        if not HAS_DIFF:
+            tk.Label(
+                self, fg=RED, bg=BG, font=FU, justify="center",
+                text="hp1631a_diff.py was not found in the same directory.\n"
+                     "Capture comparison is unavailable."
+            ).pack(pady=20)
+            tk.Button(self, text="Close", command=self.destroy, font=FU,
+                      fg=BG, bg=TEXT_DIM, relief="flat", cursor="hand2",
+                      pady=5, padx=12).pack(pady=10)
+            return
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        # ── File pickers ─────────────────────────────────────────────────
+        files = tk.Frame(body, bg=BG)
+        files.pack(fill="x", pady=(0, 6))
+
+        self._baseline_var = tk.StringVar()
+        self._candidate_var = tk.StringVar()
+
+        self._file_row(files, "BASELINE (known-good)", self._baseline_var,
+                       self._browse_baseline)
+        self._file_row(files, "CANDIDATE (suspect)", self._candidate_var,
+                       self._browse_candidate)
+
+        # ── Options ─────────────────────────────────────────────────────
+        opts = tk.Frame(body, bg=BG)
+        opts.pack(fill="x", pady=(2, 6))
+
+        tk.Label(opts, text="Reference channel", font=FSM, fg=TEXT_DIM,
+                 bg=BG).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self._ref_chan_var = tk.StringVar(value="(auto)")
+        self._ref_chan_cb = ttk.Combobox(
+            opts, textvariable=self._ref_chan_var, width=14, font=FU,
+            state="readonly", values=["(auto)"])
+        self._ref_chan_cb.grid(row=0, column=1, sticky="w", padx=(0, 14))
+
+        tk.Label(opts, text="Search window (±samples)", font=FSM,
+                 fg=TEXT_DIM, bg=BG).grid(row=0, column=2, sticky="w", padx=(0, 4))
+        self._search_win_var = tk.StringVar(value="auto")
+        tk.Entry(opts, textvariable=self._search_win_var, width=8, font=FM,
+                 bg=BG3, fg=TEXT, insertbackground=GREEN, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1
+                 ).grid(row=0, column=3, sticky="w")
+
+        self._btn(body, "▶  RUN DIFF", self._do_diff, GREEN, w=30
+                  ).pack(fill="x", pady=(2, 8))
+
+        # ── Summary text ────────────────────────────────────────────────
+        sum_frame = tk.LabelFrame(body, text="  SUMMARY  ", font=FUB,
+                                  fg=AMBER, bg=BG, highlightbackground=BORDER,
+                                  highlightthickness=1)
+        sum_frame.pack(fill="both", expand=True, pady=(0, 6))
+        self._summary_txt = scrolledtext.ScrolledText(
+            sum_frame, font=("Courier New", 9), bg=BG3, fg=TEXT,
+            insertbackground=GREEN, relief="flat", wrap="word",
+            height=10, state="disabled")
+        self._summary_txt.pack(fill="both", expand=True, padx=4, pady=4)
+        self._summary_txt.tag_configure("warn", foreground=AMBER)
+        self._summary_txt.tag_configure("bad", foreground=RED)
+        self._summary_txt.tag_configure("good", foreground=GREEN)
+
+        # ── Diverged channel list ───────────────────────────────────────
+        list_frame = tk.LabelFrame(body, text="  DIVERGED CHANNELS  ",
+                                   font=FUB, fg=AMBER, bg=BG,
+                                   highlightbackground=BORDER,
+                                   highlightthickness=1)
+        list_frame.pack(fill="both", expand=False, pady=(0, 6))
+        self._diverge_list = tk.Listbox(
+            list_frame, height=5, font=FU, bg=BG3, fg=TEXT,
+            selectbackground=GREEN_DIM, selectforeground=TEXT,
+            relief="flat", highlightthickness=0)
+        self._diverge_list.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # ── Bottom buttons ──────────────────────────────────────────────
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=(0, 10))
+        self._btn(btn_row, "📈  Show in waveform viewer",
+                  self._show_in_waveform, BLUE, w=26
+                  ).pack(side="left", padx=4)
+        self._btn(btn_row, "💾  Export divergences (CSV)",
+                  self._export_csv, w=24).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Close", command=self.destroy, font=FU,
+                  fg=BG, bg=TEXT_DIM, relief="flat", cursor="hand2",
+                  pady=5, padx=12).pack(side="left", padx=4)
+
+    def _file_row(self, parent, label, var, browse_cmd):
+        tk.Label(parent, text=label, font=FSM, fg=TEXT_DIM, bg=BG
+                 ).pack(anchor="w")
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=(1, 4))
+        tk.Entry(row, textvariable=var, font=("Courier New", 9), bg=BG3,
+                 fg=TEXT, insertbackground=GREEN, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1
+                 ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._btn(row, "…", browse_cmd, w=3).pack(side="left")
+
+    def _btn(self, parent, text, cmd, color=TEXT_DIM, w=None):
+        kw = dict(text=text, command=cmd, font=FUB, fg=BG, bg=color,
+                  activebackground=color, activeforeground=BG,
+                  relief="flat", cursor="hand2", pady=4, padx=5)
+        if w: kw["width"] = w
+        b = tk.Button(parent, **kw)
+        b.bind("<Enter>", lambda e, c=color: b.configure(bg=TEXT))
+        b.bind("<Leave>", lambda e, c=color: b.configure(bg=c))
+        return b
+
+    # ── file browsing ─────────────────────────────────────────────────────
+
+    _FILETYPES = [("Learn string / sigrok capture", "*.lrn *.sr"),
+                  ("Learn string", "*.lrn"), ("Sigrok capture", "*.sr"),
+                  ("All files", "*.*")]
+
+    def _browse_baseline(self):
+        p = filedialog.askopenfilename(title="Select baseline capture",
+                                       filetypes=self._FILETYPES)
+        if p:
+            self._baseline_var.set(p)
+            self._refresh_ref_channel_choices()
+
+    def _browse_candidate(self):
+        p = filedialog.askopenfilename(title="Select candidate capture",
+                                       filetypes=self._FILETYPES)
+        if p:
+            self._candidate_var.set(p)
+
+    def _refresh_ref_channel_choices(self):
+        """Populate the reference-channel dropdown from the baseline file,
+        without requiring a full diff run first."""
+        path = self._baseline_var.get().strip()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            cap = load_capture(path)
+        except Exception:
+            return
+        values = ["(auto)"] + cap.channel_names
+        self._ref_chan_cb["values"] = values
+        self._ref_chan_var.set("(auto)")
+
+    # ── run diff ───────────────────────────────────────────────────────────
+
+    def _do_diff(self):
+        base_path = self._baseline_var.get().strip()
+        cand_path = self._candidate_var.get().strip()
+
+        if not base_path or not os.path.exists(base_path):
+            messagebox.showerror("Missing file", "Select a valid baseline capture.")
+            return
+        if not cand_path or not os.path.exists(cand_path):
+            messagebox.showerror("Missing file", "Select a valid candidate capture.")
+            return
+
+        ref = self._ref_chan_var.get().strip()
+        ref = None if ref in ("", "(auto)") else ref
+
+        win_str = self._search_win_var.get().strip().lower()
+        if win_str in ("", "auto"):
+            search_window = None
+        else:
+            try:
+                search_window = int(win_str)
+            except ValueError:
+                messagebox.showerror("Input error",
+                    "Search window must be an integer or 'auto'.")
+                return
+
+        self._set_summary("Loading and comparing…", "warn")
+        self.update_idletasks()
+
+        def _run():
+            try:
+                baseline = load_capture(base_path)
+                candidate = load_capture(cand_path)
+                result = diff_captures(
+                    baseline, candidate, reference_channel=ref,
+                    search_window=search_window)
+            except Exception as e:
+                self.after(0, lambda: self._set_summary(f"ERROR: {e}", "bad"))
+                return
+            self.after(0, lambda: self._on_diff_done(baseline, candidate, result))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_diff_done(self, baseline, candidate, result):
+        self._baseline_cap = baseline
+        self._candidate_cap = candidate
+        self._result = result
+
+        diverged = [cd for cd in result.channel_diffs
+                   if cd.in_baseline and cd.in_candidate and cd.mismatches > 0]
+        tag = "bad" if diverged else "good"
+        self._set_summary(result.summary, tag)
+
+        self._diverge_list.delete(0, "end")
+        for cd in sorted(diverged, key=lambda c: c.first_divergence or 0):
+            self._diverge_list.insert(
+                "end",
+                f"{cd.name:<14} first@{cd.first_divergence:<6} "
+                f"{cd.mismatches}/{cd.compared_samples} ({cd.mismatch_pct:.1f}%)")
+
+        if result.alignment.score < 0.6 or result.alignment.positional_fallback:
+            messagebox.showwarning(
+                "Low-confidence alignment",
+                result.alignment.confidence_note or
+                "Alignment confidence is low — review the summary before "
+                "trusting the per-channel results.")
+
+        # Also log to the main window so it's captured in the persistent log.
+        self.app._log(
+            f"Diff: {os.path.basename(baseline.source_path)} vs "
+            f"{os.path.basename(candidate.source_path)} — "
+            f"{len(diverged)} channel(s) diverged "
+            f"(offset={result.alignment.offset:+d}, "
+            f"score={result.alignment.score:.2f})",
+            "good" if not diverged else "error")
+
+    def _set_summary(self, text, tag="info"):
+        self._summary_txt.configure(state="normal")
+        self._summary_txt.delete("1.0", "end")
+        self._summary_txt.insert("1.0", text)
+        self._summary_txt.configure(state="disabled")
+
+    # ── result actions ────────────────────────────────────────────────────
+
+    def _show_in_waveform(self):
+        if not self._result or not self._baseline_cap or not self._candidate_cap:
+            messagebox.showinfo("No results", "Run a diff first.")
+            return
+
+        result = self._result
+        baseline = self._baseline_cap
+        offset = result.alignment.offset
+
+        # Build the channel list the waveform viewer will render: the
+        # baseline's channels, trimmed to the aligned overlap region, so
+        # the divergence sample indices line up 1:1 with what's drawn.
+        channels = []
+        divergences = {}
+        for cd in result.channel_diffs:
+            if not (cd.in_baseline and cd.in_candidate):
+                continue
+            # cd.name may be "X" or "X↔Y" for positional-fallback pairs;
+            # recover the baseline-side name to pull samples from.
+            base_name = cd.name.split("↔")[0]
+            if base_name not in baseline.channel_samples:
+                continue
+            bits = baseline.channel_samples[base_name]
+            start = offset if offset >= 0 else 0
+            trimmed = bits[start:start + cd.compared_samples]
+            channels.append((cd.name, trimmed))
+            if cd.divergence_indices:
+                divergences[cd.name] = cd.divergence_indices
+
+        if not channels:
+            messagebox.showinfo("Nothing to show",
+                                "No comparable channels in this diff result.")
+            return
+
+        self.app._waveform.load_channels(channels, divergences=divergences)
+        self.app._log(
+            f"Loaded diff result into waveform viewer "
+            f"({len(divergences)} channel(s) highlighted).", "info")
+
+    def _export_csv(self):
+        if not self._result:
+            messagebox.showinfo("No results", "Run a diff first.")
+            return
+        records = self._result.divergence_records()
+        if not records:
+            messagebox.showinfo("Nothing to export", "No divergences found.")
+            return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not p:
+            return
+        import csv as _csv
+        with open(p, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["channel", "sample_index"])
+            for name, idx in records:
+                w.writerow([name, idx])
+        self.app._log(f"Divergences exported: {p}", "good")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main application
@@ -1456,6 +3371,7 @@ class App(tk.Tk):
         self.minsize(960, 700)
 
         self._settings = load_settings()
+        self._profiles = load_profiles()
         self._log_q: queue.Queue = queue.Queue()
         self._worker = Worker(self._log_q)
         self._worker.start()
@@ -1796,6 +3712,59 @@ class App(tk.Tk):
         self._sr_rate_var = tk.StringVar(value="10000000")
         self._entry(row2, self._sr_rate_var, 13).pack(side="left")
 
+        row2b = tk.Frame(f, bg=BG2); row2b.pack(fill="x", padx=6, pady=2)
+        tk.Label(row2b, text="Channel preset", font=FU, fg=TEXT_DIM,
+                 bg=BG2).pack(side="left", padx=(0,4))
+        preset_choices = ["(none)"] + sorted(CHANNEL_PRESETS)
+        self._sr_preset_var = tk.StringVar(value="(none)")
+        preset_cb = ttk.Combobox(row2b, textvariable=self._sr_preset_var,
+                                 values=preset_choices, state="readonly",
+                                 width=14, font=FU)
+        preset_cb.pack(side="left")
+        tk.Label(
+            f,
+            text="  hc11-19 needs all 19 channels (3 pods); lsi11-16\n"
+                 "  needs 16 (2 pods). Fewer channels than the preset\n"
+                 "  defines = extra labels are dropped with a warning.",
+            font=FSM, fg=TEXT_DIM, bg=BG2, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0,2))
+
+        # ── Glitch detect ─────────────────────────────────────────────────────
+        self._section(f, "GLITCH DETECT ARM")
+        gf = tk.Frame(f, bg=BG2); gf.pack(fill="x", padx=6, pady=2)
+        self._glitch_var = tk.BooleanVar(value=False)
+        self._chk(gf, "Arm glitch capture (send saved config before each RN)",
+                  self._glitch_var).pack(anchor="w")
+        gc_path_row = tk.Frame(f, bg=BG2); gc_path_row.pack(fill="x", padx=6, pady=2)
+        tk.Label(gc_path_row, text="Glitch config:", font=FU, fg=TEXT_DIM,
+                 bg=BG2).pack(side="left", padx=(0, 4))
+        self._glitch_cfg_var = tk.StringVar(
+            value=os.path.join(_SCRIPT_DIR, "glitch_config.lrn"))
+        tk.Entry(gc_path_row, textvariable=self._glitch_cfg_var, font=FSM,
+                 bg=BG3, fg=TEXT, insertbackground=GREEN, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1, width=20
+                 ).pack(side="left", padx=(0, 2))
+        self._btn(gc_path_row, "…", self._browse_glitch_cfg, w=2
+                  ).pack(side="left", padx=(0, 4))
+        self._btn(gc_path_row, "SAVE NOW", self._save_glitch_config,
+                  AMBER, w=9).pack(side="left")
+        tk.Label(
+            f,
+            text="  SAVE NOW downloads TC and saves it as the glitch config.\n"
+                 "  Set up glitch capture on the instrument first, then save.",
+            font=FSM, fg=TEXT_DIM, bg=BG2, justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 2))
+
+        self._section(f, "TRIGGER")
+        self._btn(f, "⊞  TRIGGER PATTERN BUILDER",
+                  lambda: TriggerBuilderDialog(self, self._worker),
+                  BLUE, w=28).pack(padx=6, pady=4, fill="x")
+
+        self._section(f, "TARGET PROFILES")
+        self._btn(f, "📋  MANAGE PROFILES",
+                  self._open_profile_manager,
+                  BLUE, w=28).pack(padx=6, pady=4, fill="x")
+
         self._section(f, "RUN")
         self._btn(f, "▶  CAPTURE", self._do_capture, GREEN, w=24
                   ).pack(padx=6, pady=4, fill="x")
@@ -1862,6 +3831,24 @@ class App(tk.Tk):
                   self._do_probe, w=26
                   ).pack(padx=6, pady=2, fill="x")
 
+        tk.Frame(f, bg=BORDER, height=1).pack(fill="x", padx=6, pady=4)
+        self._section(f, "COMPARE CAPTURES")
+        tk.Label(f, text="Diff a known-good baseline against a suspect\n"
+                        "capture, with automatic trigger-point alignment.",
+                 font=FSM, fg=TEXT_DIM, bg=BG2, justify="left"
+                 ).pack(anchor="w", padx=8, pady=(2,4))
+        self._btn(f, "⇄  DIFF CAPTURES",
+                  self._open_diff_dialog, AMBER if HAS_DIFF else TEXT_DARK,
+                  w=26).pack(padx=6, pady=2, fill="x")
+
+    def _open_diff_dialog(self):
+        if not HAS_DIFF:
+            messagebox.showerror(
+                "Unavailable",
+                "hp1631a_diff.py was not found alongside this script.")
+            return
+        DiffDialog(self, self)
+
     # ── BATCH tab ────────────────────────────────────────────────────────────
 
     def _build_tab_batch(self, nb):
@@ -1897,6 +3884,23 @@ class App(tk.Tk):
 
         self._batch_srq_var = tk.BooleanVar(value=False)
         self._chk(f, "Use SRQ", self._batch_srq_var).pack(anchor="w", padx=8)
+
+        self._section(f, "TARGET PROFILE  (optional)")
+        prof_row = tk.Frame(f, bg=BG2); prof_row.pack(fill="x", padx=6, pady=2)
+        self._batch_profile_var = tk.StringVar(value="(none)")
+        self._batch_profile_cb = ttk.Combobox(
+            prof_row, textvariable=self._batch_profile_var,
+            values=["(none)"], state="readonly", width=20, font=FU)
+        self._batch_profile_cb.pack(side="left", padx=(0,4))
+        self._btn(prof_row, "↻", self._refresh_batch_profiles, w=2
+                  ).pack(side="left")
+        tk.Label(
+            f,
+            text="  If set, each trace is also exported to .sr using the\n"
+                 "  profile's channel preset/names and sample rate.",
+            font=FSM, fg=TEXT_DIM, bg=BG2, justify="left"
+        ).pack(anchor="w", padx=8, pady=(0,2))
+        self._refresh_batch_profiles()
 
         self._btn(f, "▶  START BATCH", self._do_batch, GREEN, w=26
                   ).pack(padx=6, pady=10, fill="x")
@@ -1950,6 +3954,10 @@ class App(tk.Tk):
         wt = tk.Frame(wave_frame, bg=BG); wt.pack(fill="x", padx=4, pady=(2,0))
         self._btn(wt, "CLEAR", lambda: self._waveform.clear(), w=6
                   ).pack(side="right")
+        self._btn(wt, "⬡ GROUPS",
+                  lambda: BusGroupDialog(self, self._waveform),
+                  BLUE, w=10
+                  ).pack(side="right", padx=(0, 4))
 
         self._waveform = WaveformCanvas(wave_frame)
         self._waveform.pack(fill="both", expand=True, padx=2, pady=(0,4))
@@ -2031,6 +4039,9 @@ class App(tk.Tk):
         self._eos_var.set(s.get("eos", "2-LF"))
         self._cap_path_var.set(s.get("cap_path", "capture.txt"))
         self._sr_rate_var.set(s.get("sr_rate", "10000000"))
+        saved_preset = s.get("sr_preset", "(none)")
+        if saved_preset in (["(none)"] + sorted(CHANNEL_PRESETS)):
+            self._sr_preset_var.set(saved_preset)
         self._csv_stem_var.set(s.get("csv_stem", "trace"))
         self._batch_n_var.set(s.get("batch_n", "10"))
         self._batch_delay_var.set(s.get("batch_delay", "1.0"))
@@ -2040,6 +4051,32 @@ class App(tk.Tk):
             self._sr_var.set(s.get("also_sr", True))
         self._on_adapter_change()
         # Port will be set after refresh_ports
+
+    def apply_profile_to_fields(self, profile: dict):
+        """
+        Copy a target profile's connection/export fields into the live UI
+        fields (CONNECTION bar's adapter/address, CAPTURE tab's sample
+        rate and channel preset). Does not reconnect — the user still
+        clicks CONNECT, since silently changing the GPIB address on an
+        already-open connection is more likely to surprise than help.
+        """
+        if profile.get("adapter"):
+            self._adapter_var.set(profile["adapter"])
+            self._on_adapter_change()
+        if profile.get("gpib_addr"):
+            self._addr_var.set(profile["gpib_addr"])
+        if profile.get("sr_rate"):
+            self._sr_rate_var.set(profile["sr_rate"])
+        preset = profile.get("sr_preset", "(none)")
+        if preset in (["(none)"] + sorted(CHANNEL_PRESETS)):
+            self._sr_preset_var.set(preset)
+        self._log(
+            f"Profile applied: adapter={profile.get('adapter')}  "
+            f"addr={profile.get('gpib_addr')}  "
+            f"rate={profile.get('sr_rate')}  preset={preset}", "info")
+
+    def _open_profile_manager(self):
+        ProfileManagerDialog(self, self)
 
     def _collect_settings(self) -> dict:
         return {
@@ -2051,6 +4088,7 @@ class App(tk.Tk):
             "eos":         self._eos_var.get(),
             "cap_path":    self._cap_path_var.get(),
             "sr_rate":     self._sr_rate_var.get(),
+            "sr_preset":   self._sr_preset_var.get(),
             "csv_stem":    self._csv_stem_var.get(),
             "batch_n":     self._batch_n_var.get(),
             "batch_delay": self._batch_delay_var.get(),
@@ -2074,6 +4112,7 @@ class App(tk.Tk):
             elif tag == "status":         self._status_lbl.configure(text=val)
             elif tag == "acquiring":      self._set_acquiring(val)
             elif tag == "learn_channels":  self._waveform.load_channels(val)
+            elif tag == "wave_samplerate": self._waveform.set_samplerate(int(val))
             elif tag == "progress_start": self._progress.start(10)
             elif tag == "progress_done":  self._progress.stop(); self._progress["value"]=0
             elif tag == "progress_pct":
@@ -2171,9 +4210,32 @@ class App(tk.Tk):
         sr     = self._sr_var.get() and HAS_SR
         try: rate = int(self._sr_rate_var.get())
         except ValueError: rate = 0
+        preset = self._sr_preset_var.get()
+        if preset == "(none)":
+            preset = None
+        glitch_arm = self._glitch_var.get()
+        glitch_cfg = self._glitch_cfg_var.get().strip() if glitch_arm else None
         import os
         self._worker._learn_output_dir = os.path.dirname(os.path.abspath(path))
-        self._worker.submit(self._worker.do_capture, path, srq, sr, rate)
+        self._worker.submit(self._worker.do_capture, path, srq, sr, rate,
+                            preset=preset,
+                            glitch_arm=glitch_arm, glitch_config=glitch_cfg)
+
+    def _browse_glitch_cfg(self):
+        p = filedialog.askopenfilename(
+            title="Glitch capture config",
+            filetypes=[("Learn string","*.lrn"),("All","*.*")])
+        if p:
+            self._glitch_cfg_var.set(p)
+
+    def _save_glitch_config(self):
+        """Download current TC and save as the glitch config file."""
+        path = self._glitch_cfg_var.get().strip()
+        if not path:
+            messagebox.showwarning("Glitch Config",
+                                   "Set a path for the glitch config file first.")
+            return
+        self._worker.submit(self._worker.do_save_glitch_config, path)
 
     def _do_save_config(self):
         p = filedialog.asksaveasfilename(
@@ -2269,7 +4331,20 @@ class App(tk.Tk):
         srq     = self._batch_srq_var.get()
         self._batch_prog["maximum"] = 100
         self._batch_prog["value"]   = 0
-        self._worker.submit(self._worker.do_batch, n, out_dir, delay, srq)
+
+        profile = None
+        pname = self._batch_profile_var.get()
+        if pname and pname != "(none)":
+            profile = self._profiles.get(pname)
+
+        self._worker.submit(self._worker.do_batch, n, out_dir, delay, srq,
+                            profile=profile)
+
+    def _refresh_batch_profiles(self):
+        names = ["(none)"] + sorted(self._profiles)
+        self._batch_profile_cb["values"] = names
+        if self._batch_profile_var.get() not in names:
+            self._batch_profile_var.set("(none)")
 
     # ── file browsers ─────────────────────────────────────────────────────
 
